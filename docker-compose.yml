@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  frame-uploader:
+    build: .
+    # network_mode: host is REQUIRED for SSDP UDP multicast discovery.
+    # Without it, the container cannot see the TV's SSDP broadcasts.
+    # This means the app is accessible on http://localhost:3000 (no port mapping needed).
+    # network_mode: host required for SSDP on Linux; use ports mapping on macOS instead
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - TV_APP_NAME=Frame Uploader
+      - TOKEN_STORE_PATH=/app/data/tv-tokens.json
+      - SSDP_TIMEOUT_MS=4000
+      - NETWORK_SCAN_TIMEOUT_MS=500
+    volumes:
+      # Persist TV pairing tokens across container restarts
+      - tv-tokens:/app/data
+    restart: unless-stopped
+
+volumes:
+  tv-tokens:
