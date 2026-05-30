@@ -18,6 +18,15 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000).
 
+> **macOS: "Find My TV" finds nothing / `EHOSTUNREACH`?**
+> macOS Local Network Privacy (Sequoia+) silently blocks Homebrew-installed Node from reaching the LAN — discovery probes fail instantly even though the TV is online. As a workaround, run the dev server with `sudo` (root bypasses the per-binary privacy check):
+>
+> ```bash
+> sudo npm run dev
+> ```
+>
+> A cleaner permanent fix is to install Node from the official notarized installer at [nodejs.org](https://nodejs.org) instead of Homebrew, then grant it access under System Settings → Privacy & Security → Local Network.
+
 ### Environment variables
 
 All variables are optional — defaults work out of the box.

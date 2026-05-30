@@ -7,7 +7,26 @@
  */
 
 import http from "http";
+import os from "os";
 import type { DiscoveredTV, TvConnection, UploadProgressEvent } from "@/lib/types";
+
+/** Dump every network interface Node can see — the ground truth for
+ *  interface-binding / unreachable-host problems during discovery. */
+function logNetworkInterfaces() {
+  const interfaces = os.networkInterfaces();
+  const summary: string[] = [];
+  for (const [name, addrs] of Object.entries(interfaces)) {
+    for (const addr of addrs ?? []) {
+      summary.push(
+        `${name}: ${addr.address}/${addr.family}` +
+          `${addr.internal ? " (internal)" : ""}${addr.mac && addr.mac !== "00:00:00:00:00:00" ? ` mac=${addr.mac}` : ""}`
+      );
+    }
+  }
+  console.log(
+    `[discover] os.networkInterfaces():\n  ${summary.join("\n  ") || "(no interfaces reported!)"}`
+  );
+}
 
 type MulterFile = Express.Multer.File;
 
@@ -55,15 +74,28 @@ class TvConnectionManager {
   async discover(): Promise<{ tvs: DiscoveredTV[]; scanDurationMs: number }> {
     // Phase 2 implementation
     const start = Date.now();
+    console.log("[discover] Starting discovery (SSDP + subnet scan in parallel)…");
+    logNetworkInterfaces();
     const { discoverViaSsdp } = await import("./ssdp-discovery");
     const { scanSubnetForFrameTVs } = await import("./network-scanner");
 
     const [ssdpIps, scanIps] = await Promise.all([
-      discoverViaSsdp().catch(() => [] as string[]),
-      scanSubnetForFrameTVs().catch(() => [] as string[]),
+      discoverViaSsdp().catch((e) => {
+        console.warn("[discover] SSDP threw:", (e as Error).message);
+        return [] as string[];
+      }),
+      scanSubnetForFrameTVs().catch((e) => {
+        console.warn("[discover] Subnet scan threw:", (e as Error).message);
+        return [] as string[];
+      }),
     ]);
 
     const allIps = [...new Set([...ssdpIps, ...scanIps])];
+    console.log(
+      `[discover] SSDP found ${ssdpIps.length} (${ssdpIps.join(", ") || "none"}), ` +
+        `scan found ${scanIps.length} (${scanIps.join(", ") || "none"}); ` +
+        `${allIps.length} unique IP(s) to probe.`
+    );
     const tvs: DiscoveredTV[] = [];
 
     for (const ip of allIps) {
@@ -74,6 +106,9 @@ class TvConnectionManager {
       }
     }
 
+    console.log(
+      `[discover] Finished in ${Date.now() - start}ms — returning ${tvs.length} TV(s) to the UI.`
+    );
     return { tvs, scanDurationMs: Date.now() - start };
   }
 
