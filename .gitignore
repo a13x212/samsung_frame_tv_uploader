@@ -16,6 +16,9 @@ data/tv-tokens.json
 # Build output
 dist/
 
+# TypeScript incremental build info (regenerated on every build)
+*.tsbuildinfo
+
 # OS
 .DS_Store
 Thumbs.db
