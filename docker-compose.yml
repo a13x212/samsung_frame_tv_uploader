@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   frame-uploader:
-    image: ghcr.io/a13x212/samsung-frame-tv-uploader:latest
+    build: .
     # network_mode: host is required for SSDP UDP multicast discovery on Linux.
     # App will be accessible at http://<host-ip>:3000
     network_mode: host
