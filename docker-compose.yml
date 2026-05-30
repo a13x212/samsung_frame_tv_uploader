@@ -3,8 +3,7 @@ version: "3.9"
 services:
   frame-uploader:
     build: .
-    ports:
-      - "3000:3000"
+    network_mode: host
     environment:
       - PORT=3000
       - NODE_ENV=production
