@@ -333,8 +333,21 @@ class TvConnectionManager {
 
     return this.thumbnailSemaphore.run(async () => {
       const client = await this.getArtClient(tvId);
-      const thumbnails = await client.getThumbnails([contentId]);
-      const buf = thumbnails.get(contentId) ?? null;
+      // The TV's d2d socket occasionally drops the connection under rapid sequential
+      // fetches (e.g. browsing a large gallery) — one retry clears most of these blips.
+      let buf: Buffer | null = null;
+      let lastError: Error | undefined;
+      for (let attempt = 0; attempt < 2 && !buf; attempt++) {
+        if (attempt > 0) await new Promise((r) => setTimeout(r, 500));
+        try {
+          const thumbnails = await client.getThumbnails([contentId]);
+          buf = thumbnails.get(contentId) ?? null;
+          lastError = undefined;
+        } catch (e) {
+          lastError = e instanceof Error ? e : new Error(String(e));
+        }
+      }
+      if (!buf && lastError) throw lastError;
       if (buf) setCached(tvId, contentId, buf);
       return buf;
     });
