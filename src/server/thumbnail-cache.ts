@@ -1,6 +1,5 @@
 import fs from "fs";
 import path from "path";
-import os from "os";
 
 const ROOT = process.env.THUMBNAIL_CACHE_PATH
   ? path.resolve(process.env.THUMBNAIL_CACHE_PATH)
@@ -50,7 +49,9 @@ export function setCached(tvId: string, contentId: string, data: Buffer): void {
     const dir = tvDir(tvId);
     ensureDir(dir);
     const fp = filePath(tvId, contentId);
-    const tmp = path.join(os.tmpdir(), `thumb-${tvId}-${contentId}-${process.pid}-${Date.now()}.jpg`);
+    // Temp file must live in the same directory as the destination — rename() across
+    // filesystems (e.g. /tmp vs. a mounted volume in Docker) fails with EXDEV.
+    const tmp = path.join(dir, `.${contentId}-${process.pid}-${Date.now()}.tmp`);
     fs.writeFileSync(tmp, data, { mode: 0o600 });
     fs.renameSync(tmp, fp);
   } catch (e) {
