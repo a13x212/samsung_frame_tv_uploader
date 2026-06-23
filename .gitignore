@@ -13,6 +13,9 @@ out/
 # TV pairing tokens (contain authentication credentials)
 data/tv-tokens.json
 
+# Cached thumbnails (pure cache, regenerated on demand)
+data/thumbnails/
+
 # Build output
 dist/
 

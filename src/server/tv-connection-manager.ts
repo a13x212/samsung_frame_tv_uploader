@@ -30,6 +30,27 @@ function logNetworkInterfaces() {
 
 type MulterFile = Express.Multer.File;
 
+/** Caps concurrent execution of a task — the TV can only juggle a handful of
+ *  simultaneous Art Mode d2d connections before it starts rejecting/dropping them. */
+class Semaphore {
+  private queue: Array<() => void> = [];
+  private active = 0;
+  constructor(private readonly max: number) {}
+
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.active >= this.max) {
+      await new Promise<void>((resolve) => this.queue.push(resolve));
+    }
+    this.active++;
+    try {
+      return await task();
+    } finally {
+      this.active--;
+      this.queue.shift()?.();
+    }
+  }
+}
+
 /** Use native http.get to avoid Next.js's patched fetch (which blocks local network in dev). */
 function httpGet(url: string, timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -69,6 +90,9 @@ class TvConnectionManager {
   private connections: Map<string, TvConnection> = new Map();
   // Tracks in-flight pairing clients so re-pairing closes the previous WS connection.
   private pairingClients: Map<string, import("./samsung-tv-client").SamsungTvClient> = new Map();
+  // The TV can only handle a few simultaneous Art Mode d2d connections — the browser
+  // requests many thumbnails at once (one per visible grid tile), so queue them.
+  private thumbnailSemaphore = new Semaphore(1);
 
   /** Run SSDP + subnet scan, return results. */
   async discover(): Promise<{ tvs: DiscoveredTV[]; scanDurationMs: number }> {
@@ -280,6 +304,56 @@ class TvConnectionManager {
     return client.getMatteList();
   }
 
+  /** Get the paired art client for a TV, or throw if not paired. */
+  private async getArtClient(tvId: string) {
+    const connection = this.connections.get(tvId);
+    if (!connection || connection.status !== "paired") {
+      throw new Error("TV is not paired.");
+    }
+    const tv = this.discovered.get(tvId);
+    if (!tv) throw new Error(`TV ${tvId} not found.`);
+    const { SamsungArtClient } = await import("./samsung-art-client");
+    return new SamsungArtClient(tv, connection.token);
+  }
+
+  /** List photos already stored in the TV's Art Mode "My Photos" category. */
+  async listPhotos(tvId: string) {
+    const client = await this.getArtClient(tvId);
+    const photos = await client.listContent();
+    const { reconcile } = await import("./thumbnail-cache");
+    reconcile(tvId, photos.map((p) => p.content_id));
+    return photos;
+  }
+
+  /** Fetch a single thumbnail JPEG for a photo already on the TV, cached on disk after first fetch. */
+  async getThumbnail(tvId: string, contentId: string): Promise<Buffer | null> {
+    const { getCached, setCached } = await import("./thumbnail-cache");
+    const cached = getCached(tvId, contentId);
+    if (cached) return cached;
+
+    return this.thumbnailSemaphore.run(async () => {
+      const client = await this.getArtClient(tvId);
+      const thumbnails = await client.getThumbnails([contentId]);
+      const buf = thumbnails.get(contentId) ?? null;
+      if (buf) setCached(tvId, contentId, buf);
+      return buf;
+    });
+  }
+
+  /** Permanently delete photos from the TV's Art Mode storage. */
+  async deletePhotos(tvId: string, contentIds: string[]): Promise<void> {
+    const client = await this.getArtClient(tvId);
+    await client.deleteImages(contentIds);
+    const { deleteCached } = await import("./thumbnail-cache");
+    for (const id of contentIds) deleteCached(tvId, id);
+  }
+
+  /** Change the matte on a photo already stored on the TV. */
+  async changeMatte(tvId: string, contentId: string, matteId: string): Promise<void> {
+    const client = await this.getArtClient(tvId);
+    await client.setMatte(contentId, matteId);
+  }
+
   async disconnect(tvId: string): Promise<void> {
     // Close any in-flight pairing attempt before removing the connection.
     const pairing = this.pairingClients.get(tvId);
@@ -290,6 +364,8 @@ class TvConnectionManager {
     this.connections.delete(tvId);
     const { deleteToken } = await import("./token-store");
     deleteToken(tvId);
+    const { clearForTv } = await import("./thumbnail-cache");
+    clearForTv(tvId);
   }
 
   /** Upload images to a paired TV's Art Mode. Yields SSE progress events. */

@@ -30,6 +30,16 @@ interface ConnInfo {
   key: string;
 }
 
+/** One entry from get_content_list — metadata for a photo already stored on the TV. */
+export interface ArtContentItem {
+  content_id: string;
+  category_id?: string;
+  matte_id?: string;
+  width?: number;
+  height?: number;
+  image_date?: string;
+}
+
 export class SamsungArtClient {
   private tv: DiscoveredTV;
   private token: string | null;
@@ -384,6 +394,273 @@ export class SamsungArtClient {
             if (phaseTimer) { clearTimeout(phaseTimer); phaseTimer = null; }
             startPhase2();
           }
+        }
+      });
+    });
+  }
+
+  /**
+   * List photos already stored on the TV (default category "MY-C0002" = My Photos).
+   * Returns the parsed content_list — content_list in the response is itself a JSON string.
+   */
+  listContent(categoryId = "MY-C0002"): Promise<ArtContentItem[]> {
+    return new Promise((resolve, reject) => {
+      const url = this.buildWsUrl();
+      const ws = new WebSocket(url, { rejectUnauthorized: false });
+      let settled = false;
+      const settle = (err?: Error, items: ArtContentItem[] = []) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        ws.close();
+        if (err) reject(err); else resolve(items);
+      };
+      const timeout = setTimeout(() => settle(new Error("Timed out listing photos. Try again.")), 10_000);
+
+      ws.on("open", () => console.log("[art-client] listContent: ws open"));
+      ws.on("error", (e) => {
+        console.log("[art-client] listContent ws error:", e.message);
+        settle(new Error(`Connection to TV was lost. (${e.message})`));
+      });
+      ws.on("close", (code) => {
+        console.log("[art-client] listContent ws closed, code:", code);
+        settle(new Error("Connection to TV closed before the photo list arrived."));
+      });
+
+      ws.on("message", (raw) => {
+        console.log("[art-client] listContent msg:", raw.toString().slice(0, 500));
+        let outer: Record<string, unknown>;
+        try { outer = JSON.parse(raw.toString()) as Record<string, unknown>; } catch { return; }
+
+        if (outer.event === "ms.channel.ready") {
+          const reqId = uuidv4();
+          this.sendArtCommand(ws, {
+            request: "get_content_list",
+            category_id: categoryId,
+            id: reqId,
+            request_id: reqId,
+          });
+          return;
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let inner: any = outer.data;
+        if (typeof inner === "string") { try { inner = JSON.parse(inner); } catch { return; } }
+        const ev = inner?.event as string | undefined;
+
+        if (ev === "content_list_retrieved" || ev === "get_content_list") {
+          const raw = inner?.content_list ?? inner?.data?.content_list;
+          try {
+            const list = typeof raw === "string" ? JSON.parse(raw) : raw;
+            settle(undefined, Array.isArray(list) ? list : []);
+          } catch {
+            settle(new Error("Unexpected response from TV while listing photos."));
+          }
+        } else if (ev === "error") {
+          settle(new Error("TV rejected the photo list request."));
+        }
+      });
+    });
+  }
+
+  /**
+   * Download thumbnails for the given content IDs.
+   * Opens a single socket per call; the TV streams each thumbnail back framed as
+   * [4-byte BE header length][JSON header w/ fileLength][JPEG bytes] — the mirror
+   * image of the upload protocol's transferBinaryImage.
+   */
+  getThumbnails(contentIds: string[]): Promise<Map<string, Buffer>> {
+    return new Promise((resolve, reject) => {
+      if (contentIds.length === 0) { resolve(new Map()); return; }
+      const url = this.buildWsUrl();
+      const ws = new WebSocket(url, { rejectUnauthorized: false });
+      let settled = false;
+      const results = new Map<string, Buffer>();
+
+      const settle = (err?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        ws.close();
+        if (err && results.size === 0) reject(err); else resolve(results);
+      };
+      const timeout = setTimeout(() => settle(), 20_000);
+
+      ws.on("error", (e) => settle(new Error(`Connection to TV was lost. (${e.message})`)));
+      ws.on("close", () => settle());
+
+      const connectionId = Math.floor(Math.random() * 4_294_967_296);
+
+      ws.on("message", async (raw) => {
+        let outer: Record<string, unknown>;
+        try { outer = JSON.parse(raw.toString()) as Record<string, unknown>; } catch { return; }
+
+        if (outer.event === "ms.channel.ready") {
+          const reqId = uuidv4();
+          this.sendArtCommand(ws, {
+            request: "get_thumbnail_list",
+            content_id_list: contentIds.map((id) => ({ content_id: id })),
+            conn_info: {
+              d2d_mode: "socket",
+              connection_id: connectionId,
+              id: reqId,
+            },
+            id: reqId,
+            request_id: reqId,
+          });
+          return;
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let inner: any = outer.data;
+        if (typeof inner === "string") { try { inner = JSON.parse(inner); } catch { return; } }
+        const ev = inner?.event as string | undefined;
+
+        // TV replies with event "get_thumbnail_list" (not "ready_to_use" like upload).
+        // conn_info parses to { ip, port, key, secured, contentInfo, ... } — ip/port/key/secured
+        // are siblings of contentInfo (contentInfo is just an echo of our request), not nested under it.
+        if (ev === "ready_to_use" || ev === "get_thumbnail_list") {
+          let connInfo: ConnInfo;
+          try {
+            const rawConn = inner?.conn_info ?? inner?.data?.conn_info;
+            connInfo = typeof rawConn === "string" ? JSON.parse(rawConn) : rawConn;
+          } catch {
+            settle(new Error("Unexpected response from TV. Try again."));
+            return;
+          }
+
+          const connPort = parseInt(connInfo.port, 10);
+          if (connInfo.ip !== this.tv.ip || isNaN(connPort) || connPort < 1024 || connPort > 65535) {
+            settle(new Error("TV returned unexpected connection info. Try again."));
+            return;
+          }
+
+          try {
+            await this.receiveThumbnails(connInfo, contentIds, results);
+            const bytes = contentIds.reduce((sum, id) => sum + (results.get(id)?.length ?? 0), 0);
+            console.log("[art-client] getThumbnails ok:", contentIds.join(","), `(${bytes} bytes received)`);
+            settle();
+          } catch (e) {
+            settle(e instanceof Error ? e : new Error(String(e)));
+          }
+        } else if (ev === "error") {
+          console.warn("[art-client] getThumbnails rejected:", JSON.stringify(inner));
+          settle(new Error("TV rejected the thumbnail request."));
+        }
+      });
+    });
+  }
+
+  /** Read framed [4-byte len][JSON header][JPEG bytes] thumbnails off a TCP/TLS socket. */
+  private receiveThumbnails(
+    connInfo: ConnInfo,
+    contentIds: string[],
+    results: Map<string, Buffer>
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const port = parseInt(connInfo.port, 10);
+      const ip = connInfo.ip;
+
+      let buffer = Buffer.alloc(0);
+      let received = 0;
+
+      const onData = (chunk: Buffer) => {
+        buffer = Buffer.concat([buffer, chunk]);
+
+        // Drain as many complete frames as are buffered.
+        while (true) {
+          if (buffer.length < 4) break;
+          const headerLen = buffer.readUInt32BE(0);
+          if (buffer.length < 4 + headerLen) break;
+
+          // Header has no content_id field — it carries fileID/num/total/fileLength.
+          // The TV streams thumbnails back in request order, so correlate by index.
+          let header: { fileLength?: number; num?: number; fileID?: string };
+          try {
+            header = JSON.parse(buffer.slice(4, 4 + headerLen).toString("ascii"));
+          } catch {
+            socket.destroy();
+            reject(new Error("Unexpected thumbnail header from TV."));
+            return;
+          }
+
+          const fileLength = Number(header.fileLength ?? 0);
+          const frameTotal = 4 + headerLen + fileLength;
+          if (buffer.length < frameTotal) break;
+
+          const index = header.num ?? received;
+          const contentId = contentIds[index] ?? header.fileID ?? `thumbnail_${received}`;
+          const imageBytes = buffer.slice(4 + headerLen, frameTotal);
+          results.set(contentId, Buffer.from(imageBytes));
+          received++;
+          buffer = buffer.slice(frameTotal);
+
+          if (received >= contentIds.length) {
+            socket.destroy();
+            resolve();
+            return;
+          }
+        }
+      };
+
+      const socket: net.Socket | tls.TLSSocket = connInfo.secured
+        ? tls.connect({ port, host: ip, rejectUnauthorized: false })
+        : net.connect({ port, host: ip });
+
+      socket.setTimeout(20_000);
+      socket.on("timeout", () => {
+        socket.destroy();
+        // Resolve with whatever we got — partial thumbnail sets are still useful.
+        resolve();
+      });
+      socket.on("data", onData);
+      socket.on("error", (e) => reject(new Error(`Thumbnail download failed. (${e.message})`)));
+      socket.on("close", () => resolve());
+    });
+  }
+
+  /** Permanently delete one or more photos from the TV's Art Mode storage. */
+  deleteImages(contentIds: string[]): Promise<void> {
+    return new Promise((resolve) => {
+      const url = this.buildWsUrl();
+      const ws = new WebSocket(url, { rejectUnauthorized: false });
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        ws.close();
+        resolve();
+      };
+      // The TV doesn't always confirm deletion explicitly — resolve after a
+      // short grace period regardless, mirroring setMatte's fallback behavior.
+      const timeout = setTimeout(done, 8_000);
+
+      ws.on("error", () => done());
+      ws.on("close", () => done());
+
+      ws.on("message", (raw) => {
+        let outer: Record<string, unknown>;
+        try { outer = JSON.parse(raw.toString()) as Record<string, unknown>; } catch { return; }
+
+        if (outer.event === "ms.channel.ready") {
+          const reqId = uuidv4();
+          this.sendArtCommand(ws, {
+            request: "delete_image_list",
+            content_id_list: contentIds.map((id) => ({ content_id: id })),
+            id: reqId,
+            request_id: reqId,
+          });
+          return;
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let inner: any = outer.data;
+        if (typeof inner === "string") { try { inner = JSON.parse(inner); } catch { return; } }
+        const ev = inner?.event as string | undefined;
+
+        if (ev === "delete_image_list" || ev === "image_deleted") {
+          done();
         }
       });
     });

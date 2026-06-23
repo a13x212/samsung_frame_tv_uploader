@@ -6,8 +6,9 @@ import { getSession } from "@/lib/api-client";
 import DiscoverStep from "@/components/steps/DiscoverStep";
 import PairStep from "@/components/steps/PairStep";
 import UploadStep from "@/components/steps/UploadStep";
+import ManageStep from "@/components/steps/ManageStep";
 
-export type AppStep = "discover" | "pair" | "upload";
+export type AppStep = "discover" | "pair" | "upload" | "manage";
 
 export interface AppState {
   step: AppStep;
@@ -129,7 +130,11 @@ export default function Home() {
             uploadJobs={state.uploadJobs}
             onUploadJobsUpdate={setUploadJobs}
             onDisconnect={goToDiscover}
+            onManage={() => setStep("manage")}
           />
+        )}
+        {state.step === "manage" && state.selectedTv && (
+          <ManageStep tv={state.selectedTv} onBack={() => setStep("upload")} />
         )}
       </div>
     </main>

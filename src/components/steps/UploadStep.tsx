@@ -40,6 +40,7 @@ interface UploadStepProps {
   uploadJobs: UploadJob[];
   onUploadJobsUpdate: (jobs: UploadJob[]) => void;
   onDisconnect: () => void;
+  onManage: () => void;
 }
 
 interface PendingFile {
@@ -67,6 +68,7 @@ export default function UploadStep({
   uploadJobs,
   onUploadJobsUpdate,
   onDisconnect,
+  onManage,
 }: UploadStepProps) {
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -217,12 +219,20 @@ export default function UploadStep({
           <span className="font-medium text-slate-900">{tv.name}</span>
           <span className="text-xs text-slate-400">connected</span>
         </div>
-        <button
-          onClick={handleDisconnect}
-          className="text-xs text-slate-400 hover:text-slate-600 transition-colors"
-        >
-          Disconnect
-        </button>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={onManage}
+            className="text-xs text-blue-600 hover:text-blue-700 transition-colors"
+          >
+            Manage Photos
+          </button>
+          <button
+            onClick={handleDisconnect}
+            className="text-xs text-slate-400 hover:text-slate-600 transition-colors"
+          >
+            Disconnect
+          </button>
+        </div>
       </div>
 
       {/* Drop zone */}

@@ -6,6 +6,7 @@ import type {
   UploadJob,
   UploadProgressEvent,
   MatteId,
+  ArtPhoto,
 } from "./types";
 
 const BASE = "";
@@ -119,6 +120,40 @@ export async function* uploadPhotos(
       }
     }
   }
+}
+
+// ─── Photo management (photos already on the TV) ─────────────────────────────
+
+export async function listPhotos(
+  tvId: string
+): Promise<ApiResult<{ photos: ArtPhoto[] }>> {
+  return apiFetch<{ photos: ArtPhoto[] }>(`/api/tv/${tvId}/photos`);
+}
+
+/** URL for an <img> tag — fetched directly by the browser, not via apiFetch. */
+export function thumbnailUrl(tvId: string, contentId: string): string {
+  return `/api/tv/${tvId}/photos/${encodeURIComponent(contentId)}/thumbnail`;
+}
+
+export async function deletePhotos(
+  tvId: string,
+  contentIds: string[]
+): Promise<ApiResult<{ contentIds: string[] }>> {
+  return apiFetch<{ contentIds: string[] }>(`/api/tv/${tvId}/photos`, {
+    method: "DELETE",
+    body: JSON.stringify({ contentIds }),
+  });
+}
+
+export async function changeMatte(
+  tvId: string,
+  contentId: string,
+  matteId: MatteId
+): Promise<ApiResult<{ contentId: string; matteId: string }>> {
+  return apiFetch<{ contentId: string; matteId: string }>(
+    `/api/tv/${tvId}/photos/${encodeURIComponent(contentId)}/matte`,
+    { method: "PUT", body: JSON.stringify({ matteId }) }
+  );
 }
 
 // ─── Session ──────────────────────────────────────────────────────────────────

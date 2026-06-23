@@ -101,6 +101,18 @@ export type MatteId = "none" | string;
 // Keep MATTE_OPTIONS as a legacy alias so existing imports don't break
 export const MATTE_OPTIONS = MATTE_TYPES;
 
+// ─── Photo management (photos already on the TV) ─────────────────────────────
+
+/** A photo already stored in the TV's Art Mode "My Photos" category. */
+export interface ArtPhoto {
+  content_id: string;
+  category_id?: string;
+  matte_id?: string;
+  width?: number;
+  height?: number;
+  image_date?: string;
+}
+
 // ─── API Response shapes ──────────────────────────────────────────────────────
 
 export interface ApiOk<T> {

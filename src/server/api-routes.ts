@@ -27,6 +27,7 @@ function isValidIPv4(ip: string): boolean {
 
 const TV_ID_RE = /^tv_[\d_]+$/;
 const MATTE_ID_RE = /^[a-z_]{1,40}$/;
+const CONTENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 // ─── Magic-bytes validation ───────────────────────────────────────────────────
 
@@ -75,6 +76,22 @@ const uploadLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { ok: false, error: "Too many upload requests", hint: "Wait a minute and try again" },
+});
+
+const thumbnailLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: "Too many thumbnail requests", hint: "Wait a minute and try again" },
+});
+
+const manageLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: "Too many requests", hint: "Wait a minute and try again" },
 });
 
 // ─── Multer with MIME type filter ─────────────────────────────────────────────
@@ -230,6 +247,103 @@ apiRouter.get("/tv/:tvId/matte-list", async (req: Request, res: Response) => {
     err(res, msg, "Make sure the TV is paired and try again", 500);
   }
 });
+
+// ─── Photo management (photos already on the TV) ─────────────────────────────
+
+apiRouter.get("/tv/:tvId/photos", manageLimiter, async (req: Request, res: Response) => {
+  const tvId = String(req.params.tvId);
+  if (!TV_ID_RE.test(tvId)) { err(res, "Invalid TV ID", "", 400); return; }
+  try {
+    const { tvManager } = await getManager();
+    const photos = await tvManager.listPhotos(tvId);
+    ok(res, { photos });
+  } catch (e: unknown) {
+    console.error("[photos list]", e);
+    const msg = sanitizeError(e instanceof Error ? e.message : "Failed to list photos");
+    err(res, msg, "Make sure the TV is paired and try again", 500);
+  }
+});
+
+apiRouter.get(
+  "/tv/:tvId/photos/:contentId/thumbnail",
+  thumbnailLimiter,
+  async (req: Request, res: Response) => {
+    const tvId = String(req.params.tvId);
+    const contentId = String(req.params.contentId);
+    if (!TV_ID_RE.test(tvId) || !CONTENT_ID_RE.test(contentId)) {
+      err(res, "Invalid request", "", 400);
+      return;
+    }
+    try {
+      const { tvManager } = await getManager();
+      const thumbnail = await tvManager.getThumbnail(tvId, contentId);
+      if (!thumbnail) {
+        err(res, "Thumbnail not found", "Try again", 404);
+        return;
+      }
+      res.setHeader("Content-Type", "image/jpeg");
+      res.setHeader("Cache-Control", "private, max-age=86400");
+      res.send(thumbnail);
+    } catch (e: unknown) {
+      console.error("[thumbnail]", e);
+      const msg = sanitizeError(e instanceof Error ? e.message : "Failed to load thumbnail");
+      err(res, msg, "Make sure the TV is paired and try again", 500);
+    }
+  }
+);
+
+apiRouter.delete("/tv/:tvId/photos", manageLimiter, async (req: Request, res: Response) => {
+  const tvId = String(req.params.tvId);
+  if (!TV_ID_RE.test(tvId)) { err(res, "Invalid TV ID", "", 400); return; }
+
+  const rawIds = req.body?.contentIds;
+  const contentIds: string[] = Array.isArray(rawIds) ? rawIds.map(String) : [];
+  if (contentIds.length === 0 || !contentIds.every((id) => CONTENT_ID_RE.test(id))) {
+    err(res, "Invalid content IDs", "Select at least one photo to delete");
+    return;
+  }
+  if (contentIds.length > 50) {
+    err(res, "Too many photos", "Delete at most 50 photos at a time");
+    return;
+  }
+
+  try {
+    const { tvManager } = await getManager();
+    await tvManager.deletePhotos(tvId, contentIds);
+    ok(res, { contentIds });
+  } catch (e: unknown) {
+    console.error("[photos delete]", e);
+    const msg = sanitizeError(e instanceof Error ? e.message : "Failed to delete photos");
+    err(res, msg, "Make sure the TV is paired and try again", 500);
+  }
+});
+
+apiRouter.put(
+  "/tv/:tvId/photos/:contentId/matte",
+  manageLimiter,
+  async (req: Request, res: Response) => {
+    const tvId = String(req.params.tvId);
+    const contentId = String(req.params.contentId);
+    if (!TV_ID_RE.test(tvId) || !CONTENT_ID_RE.test(contentId)) {
+      err(res, "Invalid request", "", 400);
+      return;
+    }
+    const matteId = String(req.body?.matteId ?? "");
+    if (!MATTE_ID_RE.test(matteId)) {
+      err(res, "Invalid matte ID", "");
+      return;
+    }
+    try {
+      const { tvManager } = await getManager();
+      await tvManager.changeMatte(tvId, contentId, matteId);
+      ok(res, { contentId, matteId });
+    } catch (e: unknown) {
+      console.error("[matte change]", e);
+      const msg = sanitizeError(e instanceof Error ? e.message : "Failed to change matte");
+      err(res, msg, "Make sure the TV is paired and try again", 500);
+    }
+  }
+);
 
 // ─── Upload ───────────────────────────────────────────────────────────────────
 
