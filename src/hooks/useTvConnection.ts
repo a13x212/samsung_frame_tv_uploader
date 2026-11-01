@@ -22,7 +22,6 @@ export function useTvConnection(tvId: string | null) {
     setConnection({
       tvId,
       status: "connecting",
-      token: null,
       errorMessage: null,
       connectedAt: null,
     });
@@ -32,7 +31,6 @@ export function useTvConnection(tvId: string | null) {
       setConnection({
         tvId,
         status: "error",
-        token: null,
         errorMessage: res.hint,
         connectedAt: null,
       });

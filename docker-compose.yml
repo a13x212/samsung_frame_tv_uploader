@@ -11,6 +11,8 @@ services:
       - TOKEN_STORE_PATH=/app/data/tv-tokens.json
       - SSDP_TIMEOUT_MS=4000
       - NETWORK_SCAN_TIMEOUT_MS=500
+      # Set only when behind a reverse proxy (e.g. TRUST_PROXY=1)
+      # - TRUST_PROXY=1
     volumes:
       - tv-tokens:/app/data
     restart: unless-stopped

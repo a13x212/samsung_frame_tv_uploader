@@ -9,6 +9,17 @@
 import http from "http";
 import os from "os";
 import type { DiscoveredTV, TvConnection, UploadProgressEvent } from "@/lib/types";
+import { MAX_UPLOAD_FILES } from "@/lib/types";
+
+/** Server-only connection record — includes the pairing token, which must
+ *  never be serialised into an HTTP response. Use toPublic() for API output. */
+interface StoredConnection extends TvConnection {
+  token: string | null;
+}
+
+function toPublic({ tvId, status, errorMessage, connectedAt }: StoredConnection): TvConnection {
+  return { tvId, status, errorMessage, connectedAt };
+}
 
 /** Dump every network interface Node can see — the ground truth for
  *  interface-binding / unreachable-host problems during discovery. */
@@ -87,7 +98,7 @@ function parseModelYear(model: string | undefined): number {
 
 class TvConnectionManager {
   private discovered: Map<string, DiscoveredTV> = new Map();
-  private connections: Map<string, TvConnection> = new Map();
+  private connections: Map<string, StoredConnection> = new Map();
   // Tracks in-flight pairing clients so re-pairing closes the previous WS connection.
   private pairingClients: Map<string, import("./samsung-tv-client").SamsungTvClient> = new Map();
   // The TV can only handle a few simultaneous Art Mode d2d connections — the browser
@@ -236,12 +247,15 @@ class TvConnectionManager {
     return [...this.discovered.values()];
   }
 
+  /** Public (token-free) view of all connections, safe for API responses. */
   listConnections(): TvConnection[] {
-    return [...this.connections.values()];
+    return [...this.connections.values()].map(toPublic);
   }
 
+  /** Public (token-free) view of one connection, safe for API responses. */
   getConnection(tvId: string): TvConnection | null {
-    return this.connections.get(tvId) ?? null;
+    const conn = this.connections.get(tvId);
+    return conn ? toPublic(conn) : null;
   }
 
   /** Start pairing with a TV — triggers approval dialog on TV screen. */
@@ -397,9 +411,8 @@ class TvConnectionManager {
     if (!tv) throw new Error(`TV ${tvId} not found.`);
 
     // Cap batch size — the TV has limited memory and can't queue unlimited art uploads.
-    const MAX_BATCH = 20;
-    if (files.length > MAX_BATCH) {
-      throw new Error(`Maximum ${MAX_BATCH} photos per upload. Please select fewer at a time.`);
+    if (files.length > MAX_UPLOAD_FILES) {
+      throw new Error(`Maximum ${MAX_UPLOAD_FILES} photos per upload. Please select fewer at a time.`);
     }
 
     const { SamsungArtClient } = await import("./samsung-art-client");

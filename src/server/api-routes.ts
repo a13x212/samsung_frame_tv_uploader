@@ -1,7 +1,9 @@
-import { Router, Request, Response } from "express";
+import { Router, Request, Response, NextFunction } from "express";
+import { isIPv4 } from "net";
 import multer from "multer";
 import rateLimit from "express-rate-limit";
 import type { ApiOk, ApiError } from "@/lib/types";
+import { MAX_UPLOAD_FILES } from "@/lib/types";
 
 // Import manager lazily so module is loaded once server is initialised
 let _manager: typeof import("./tv-connection-manager") | null = null;
@@ -14,14 +16,25 @@ export const apiRouter = Router();
 
 // ─── Validation helpers ───────────────────────────────────────────────────────
 
-/** Accept only valid dotted-quad IPv4 that isn't loopback or link-local (prevents SSRF). */
-function isValidIPv4(ip: string): boolean {
-  if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) return false;
-  const parts = ip.split(".").map((n) => parseInt(n, 10));
-  if (parts.some((n) => n > 255)) return false;
-  const [a, b] = parts;
-  // Block loopback (127.*), link-local (169.254.*), and unspecified (0.*)
-  if (a === 127 || a === 0 || (a === 169 && b === 254)) return false;
+/**
+ * Accept only canonical dotted-quad IPv4 outside special-purpose ranges (SSRF guard).
+ *
+ * The string is later passed verbatim to http.get / WebSocket, and the OS resolver
+ * treats leading-zero octets as octal ("0177.0.0.1" → 127.0.0.1), so non-canonical
+ * forms must be rejected outright rather than normalised with parseInt.
+ * RFC1918 and public addresses stay allowed (the TV lives on the LAN, sometimes routed).
+ */
+export function isValidIPv4(ip: string): boolean {
+  if (typeof ip !== "string" || !isIPv4(ip)) return false;
+  const octets = ip.split(".");
+  if (octets.length !== 4 || octets.some((o) => !/^\d{1,3}$/.test(o) || /^0\d/.test(o))) {
+    return false;
+  }
+  const [a, b] = octets.map(Number);
+  if (a === 0) return false; // 0.0.0.0/8 "this network"
+  if (a === 127) return false; // 127.0.0.0/8 loopback
+  if (a === 169 && b === 254) return false; // 169.254.0.0/16 link-local
+  if (a >= 224) return false; // 224.0.0.0/4 multicast, 240.0.0.0/4 reserved + broadcast
   return true;
 }
 
@@ -105,6 +118,11 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
     fileSize: (Number(process.env.MAX_UPLOAD_SIZE_MB) || 100) * 1024 * 1024,
+    // Cap file count here so excess files are rejected while streaming, before
+    // they are all buffered in memory.
+    files: MAX_UPLOAD_FILES,
+    fields: 40,
+    fieldSize: 1024,
   },
   fileFilter: (_req, file, cb) => {
     cb(null, ALLOWED_MIME.has(file.mimetype));
@@ -122,6 +140,64 @@ function err(res: Response, error: string, hint: string, status = 400) {
   const body: ApiError = { ok: false, error, hint };
   res.status(status).json(body);
 }
+
+/** Run multer and turn its errors into clean JSON instead of Express's HTML error page. */
+function uploadFiles(req: Request, res: Response, next: NextFunction) {
+  upload.array("files")(req, res, (e: unknown) => {
+    if (!e) { next(); return; }
+    if (e instanceof multer.MulterError) {
+      switch (e.code) {
+        case "LIMIT_FILE_COUNT":
+          err(res, "Too many files", `Upload at most ${MAX_UPLOAD_FILES} photos at a time`);
+          return;
+        case "LIMIT_FILE_SIZE":
+          err(res, "File too large", "One or more photos exceed the maximum upload size", 413);
+          return;
+        case "LIMIT_UNEXPECTED_FILE":
+          err(res, "Unexpected file field", 'Send photos in the "files" field');
+          return;
+        default:
+          err(res, "Invalid upload", sanitizeError(e.message));
+          return;
+      }
+    }
+    console.error("[upload parse]", e);
+    err(res, "Upload failed", "Try again", 400);
+  });
+}
+
+// ─── CSRF / cross-site guard ──────────────────────────────────────────────────
+// The API has no auth and is reachable LAN-wide. Block browser-initiated
+// cross-site state-changing requests (CORS "simple" POSTs need no preflight).
+// Requests with neither header (curl, scripts) pass: this is CSRF defense, not auth.
+
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+apiRouter.use((req: Request, res: Response, next: NextFunction) => {
+  if (SAFE_METHODS.has(req.method)) { next(); return; }
+
+  const fetchSite = req.get("sec-fetch-site");
+  if (fetchSite === "cross-site" || fetchSite === "same-site") {
+    err(res, "Cross-site request blocked", "Use the uploader from its own page", 403);
+    return;
+  }
+
+  const origin = req.get("origin");
+  if (origin !== undefined) {
+    let originHost: string | null = null;
+    try {
+      originHost = new URL(origin).host;
+    } catch {
+      originHost = null; // e.g. "null" origin from sandboxed iframes
+    }
+    if (!originHost || originHost !== req.get("host")) {
+      err(res, "Cross-site request blocked", "Use the uploader from its own page", 403);
+      return;
+    }
+  }
+
+  next();
+});
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 
@@ -350,7 +426,7 @@ apiRouter.put(
 apiRouter.post(
   "/tv/:tvId/upload",
   uploadLimiter,
-  upload.array("files"),
+  uploadFiles,
   async (req: Request, res: Response) => {
     const tvId = String(req.params.tvId);
     if (!TV_ID_RE.test(tvId)) { err(res, "Invalid TV ID", "", 400); return; }
