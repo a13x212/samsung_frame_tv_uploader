@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import os from "os";
+import crypto from "crypto";
 
 const STORE_PATH = process.env.TOKEN_STORE_PATH
   ? path.resolve(process.env.TOKEN_STORE_PATH)
@@ -36,9 +36,27 @@ function writeStore(store: TokenStore): void {
   ensureDir();
   const json = JSON.stringify(store, null, 2);
   // Write to a temp file then rename — atomic on POSIX, protects against partial writes on crash.
-  const tmp = path.join(os.tmpdir(), `tv-tokens-${process.pid}.json`);
-  fs.writeFileSync(tmp, json, { encoding: "utf-8", mode: 0o600 });
-  fs.renameSync(tmp, STORE_PATH);
+  // The temp file lives next to the store (not in os.tmpdir()): rename() across filesystems
+  // fails with EXDEV (e.g. Docker volume vs. /tmp), and a predictable name in a shared /tmp
+  // invites symlink attacks. "wx" = O_CREAT|O_EXCL, so an existing file or symlink at the
+  // random path makes open fail instead of being followed.
+  const tmp = path.join(
+    path.dirname(STORE_PATH),
+    `.${path.basename(STORE_PATH)}.${crypto.randomBytes(8).toString("hex")}.tmp`
+  );
+  try {
+    const fd = fs.openSync(tmp, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, json, { encoding: "utf-8" });
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, STORE_PATH);
+  } catch (err) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    throw err;
+  }
   // Ensure the final file has restricted permissions (rename preserves source mode on most OSes).
   try { fs.chmodSync(STORE_PATH, 0o600); } catch { /* non-POSIX FS — best effort */ }
 }
