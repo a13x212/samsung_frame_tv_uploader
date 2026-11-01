@@ -5,7 +5,7 @@ Upload artwork to your Samsung Frame TV from your local network.
 ## Requirements
 
 - Samsung Frame TV on the same local network as your machine
-- Node.js 22+ (local) or Docker (container)
+- Node.js 22.23.4 or newer 22.x (local; see `.nvmrc`, e.g. `nvm use`) or Docker (container; the image pins `node:22.23.4-alpine`)
 
 ---
 
@@ -79,6 +79,16 @@ The `tv-tokens` Docker volume keeps your TV paired across container restarts. To
 
 ```bash
 docker-compose down -v
+```
+
+### Upgrading from an older image (volume ownership)
+
+The container now runs as the unprivileged `node` user (uid 1000) instead of root. A fresh `tv-tokens` volume picks up the correct ownership automatically, but a volume created by an older root-running image is still owned by root, and the app won't be able to write tokens to it. Fix it once before starting the new image.
+
+Docker Compose prefixes volume names with the project name, which defaults to the directory name (lowercased), so the volume is `<project>_tv-tokens`, e.g. `samsung_frame_tv_uploader_tv-tokens`. Check with `docker volume ls`, then run:
+
+```bash
+docker run --rm -v <project>_tv-tokens:/app/data alpine chown -R 1000:1000 /app/data
 ```
 
 ---
