@@ -22,6 +22,14 @@ const APP_NAME = process.env.TV_APP_NAME || "Frame Uploader";
 const DEVICE_ID = process.env.TV_DEVICE_ID || "frame-uploader-server-001";
 const ART_CHANNEL = "com.samsung.art-app";
 const UPLOAD_TIMEOUT_MS = 60_000;
+// The art channel only exchanges small JSON control messages; cap them well below
+// the ws default (100 MiB) so a device impersonating the TV can't exhaust memory.
+const WS_MAX_PAYLOAD_BYTES = 1024 * 1024;
+// Bounds on the framed thumbnail stream. Lengths come from the (untrusted) peer:
+// TV connections skip cert validation, so never buffer more than these allow.
+const MAX_THUMB_HEADER_BYTES = 64 * 1024;
+const MAX_THUMB_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_THUMB_FRAME_BYTES = 4 + MAX_THUMB_HEADER_BYTES + MAX_THUMB_IMAGE_BYTES;
 
 interface ConnInfo {
   ip: string;
@@ -92,7 +100,7 @@ export class SamsungArtClient {
     return new Promise((resolve, reject) => {
       const url = this.buildWsUrl();
       console.log("[art-client] connecting to:", url.replace(/token=[^&]+/, "token=***"));
-      const ws = new WebSocket(url, { rejectUnauthorized: false });
+      const ws = new WebSocket(url, { rejectUnauthorized: false, maxPayload: WS_MAX_PAYLOAD_BYTES });
       this.ws = ws;
 
       const requestId = uuidv4();
@@ -246,7 +254,7 @@ export class SamsungArtClient {
   getMatteList(): Promise<Record<string, unknown>> {
     return new Promise((resolve) => {
       const url = this.buildWsUrl();
-      const ws = new WebSocket(url, { rejectUnauthorized: false });
+      const ws = new WebSocket(url, { rejectUnauthorized: false, maxPayload: WS_MAX_PAYLOAD_BYTES });
       let settled = false;
       const done = (result: Record<string, unknown> = {}) => {
         if (!settled) { settled = true; ws.close(); resolve(result); }
@@ -301,7 +309,7 @@ export class SamsungArtClient {
   setMatte(contentId: string, matteId: string): Promise<void> {
     return new Promise((resolve) => {
       const url = this.buildWsUrl();
-      const ws = new WebSocket(url, { rejectUnauthorized: false });
+      const ws = new WebSocket(url, { rejectUnauthorized: false, maxPayload: WS_MAX_PAYLOAD_BYTES });
       let settled = false;
       let inPhase2 = false;
       let phaseTimer: ReturnType<typeof setTimeout> | null = null;
@@ -406,7 +414,7 @@ export class SamsungArtClient {
   listContent(categoryId = "MY-C0002"): Promise<ArtContentItem[]> {
     return new Promise((resolve, reject) => {
       const url = this.buildWsUrl();
-      const ws = new WebSocket(url, { rejectUnauthorized: false });
+      const ws = new WebSocket(url, { rejectUnauthorized: false, maxPayload: WS_MAX_PAYLOAD_BYTES });
       let settled = false;
       const settle = (err?: Error, items: ArtContentItem[] = []) => {
         if (settled) return;
@@ -473,7 +481,7 @@ export class SamsungArtClient {
     return new Promise((resolve, reject) => {
       if (contentIds.length === 0) { resolve(new Map()); return; }
       const url = this.buildWsUrl();
-      const ws = new WebSocket(url, { rejectUnauthorized: false });
+      const ws = new WebSocket(url, { rejectUnauthorized: false, maxPayload: WS_MAX_PAYLOAD_BYTES });
       let settled = false;
       const results = new Map<string, Buffer>();
 
@@ -564,27 +572,52 @@ export class SamsungArtClient {
       let buffer = Buffer.alloc(0);
       let received = 0;
 
+      let failed = false;
+      const fail = () => {
+        if (failed) return;
+        failed = true;
+        socket.destroy();
+        reject(new Error("Unexpected thumbnail data from TV."));
+      };
+
       const onData = (chunk: Buffer) => {
+        if (failed) return;
         buffer = Buffer.concat([buffer, chunk]);
 
         // Drain as many complete frames as are buffered.
         while (true) {
           if (buffer.length < 4) break;
           const headerLen = buffer.readUInt32BE(0);
+          if (headerLen > MAX_THUMB_HEADER_BYTES) {
+            fail();
+            return;
+          }
           if (buffer.length < 4 + headerLen) break;
 
           // Header has no content_id field — it carries fileID/num/total/fileLength.
           // The TV streams thumbnails back in request order, so correlate by index.
           let header: { fileLength?: number; num?: number; fileID?: string };
           try {
-            header = JSON.parse(buffer.slice(4, 4 + headerLen).toString("ascii"));
+            const parsed: unknown = JSON.parse(buffer.slice(4, 4 + headerLen).toString("ascii"));
+            if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+              fail();
+              return;
+            }
+            header = parsed as { fileLength?: number; num?: number; fileID?: string };
           } catch {
-            socket.destroy();
-            reject(new Error("Unexpected thumbnail header from TV."));
+            fail();
             return;
           }
 
           const fileLength = Number(header.fileLength ?? 0);
+          if (
+            !Number.isSafeInteger(fileLength) ||
+            fileLength < 0 ||
+            fileLength > MAX_THUMB_IMAGE_BYTES
+          ) {
+            fail();
+            return;
+          }
           const frameTotal = 4 + headerLen + fileLength;
           if (buffer.length < frameTotal) break;
 
@@ -601,6 +634,10 @@ export class SamsungArtClient {
             return;
           }
         }
+
+        // Whatever remains is an incomplete frame; it can never legitimately exceed
+        // the largest allowed frame, so stop buffering if the peer keeps sending.
+        if (buffer.length > MAX_THUMB_FRAME_BYTES) fail();
       };
 
       const socket: net.Socket | tls.TLSSocket = connInfo.secured
@@ -623,7 +660,7 @@ export class SamsungArtClient {
   deleteImages(contentIds: string[]): Promise<void> {
     return new Promise((resolve) => {
       const url = this.buildWsUrl();
-      const ws = new WebSocket(url, { rejectUnauthorized: false });
+      const ws = new WebSocket(url, { rejectUnauthorized: false, maxPayload: WS_MAX_PAYLOAD_BYTES });
       let settled = false;
       const done = () => {
         if (settled) return;
