@@ -16,15 +16,27 @@ import { tvManager } from "./src/server/tv-connection-manager";
 const dev = process.env.NODE_ENV !== "production";
 const port = Number(process.env.PORT) || 3000;
 
+/** TRUST_PROXY: unset/empty → don't trust; "2" → hop count; "true"/"false" → boolean;
+ *  anything else (e.g. "loopback", "10.0.0.0/8") → passed through to Express as-is. */
+function parseTrustProxy(raw: string | undefined): boolean | number | string | undefined {
+  const v = raw?.trim();
+  if (!v) return undefined;
+  if (v === "true") return true;
+  if (v === "false") return false;
+  if (/^\d+$/.test(v)) return Number(v);
+  return v;
+}
+
 const app = next({ dev });
 const handle = app.getRequestHandler();
 
 app.prepare().then(() => {
   const expressApp = express();
 
-  // Trust the first proxy hop so express-rate-limit keys on the real client IP
-  // when the app is deployed behind nginx/Caddy/etc.
-  expressApp.set("trust proxy", 1);
+  // Trust X-Forwarded-For only when explicitly configured. Trusting it without a
+  // proxy in front lets any client spoof its IP and evade the rate limiters.
+  const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
+  if (trustProxy !== undefined) expressApp.set("trust proxy", trustProxy);
 
   // Security headers
   expressApp.use((_req, res, next) => {
@@ -37,7 +49,9 @@ app.prepare().then(() => {
     res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
     res.setHeader(
       "Content-Security-Policy",
-      "default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'unsafe-eval'"
+      "default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; " +
+        // Next.js needs 'unsafe-eval' only for dev-mode HMR/React Refresh.
+        `script-src 'self' 'unsafe-inline'${dev ? " 'unsafe-eval'" : ""}`
     );
     next();
   });

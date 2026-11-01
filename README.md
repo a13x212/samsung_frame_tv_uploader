@@ -38,6 +38,7 @@ All variables are optional — defaults work out of the box.
 | `TOKEN_STORE_PATH` | `./data/tv-tokens.json` | Where pairing tokens are persisted |
 | `SSDP_TIMEOUT_MS` | `4000` | SSDP discovery timeout (ms) |
 | `NETWORK_SCAN_TIMEOUT_MS` | `500` | Per-host scan timeout (ms) |
+| `TRUST_PROXY` | _(unset)_ | Express `trust proxy` value (hop count, `true`, `loopback`, CIDR). Set only when behind a reverse proxy; otherwise clients can spoof `X-Forwarded-For` and bypass rate limits |
 
 ---
 

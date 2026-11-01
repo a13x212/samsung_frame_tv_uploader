@@ -49,7 +49,6 @@ export default function PairStep({
       onConnectionUpdate({
         tvId: tv.id,
         status: "error",
-        token: null,
         errorMessage: res.hint,
         connectedAt: null,
       });

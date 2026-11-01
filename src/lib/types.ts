@@ -21,15 +21,20 @@ export type PairingStatus =
   | "rejected"
   | "error";
 
+/** Client-facing connection state. Deliberately has no `token`: the Samsung
+ *  remote-control token never leaves the server. */
 export interface TvConnection {
   tvId: string;
   status: PairingStatus;
-  token: string | null;
   errorMessage: string | null;
   connectedAt: string | null; // ISO date string
 }
 
 // ─── Upload ───────────────────────────────────────────────────────────────────
+
+/** Max photos per upload request. Shared by the multer limit and the manager's
+ *  batch check so the two cannot drift. */
+export const MAX_UPLOAD_FILES = 20;
 
 export type UploadPhase =
   | "queued"
