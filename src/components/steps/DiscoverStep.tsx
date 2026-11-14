@@ -80,7 +80,7 @@ export default function DiscoverStep({
   };
 
   return (
-    <div className="space-y-6">
+    <div className="mx-auto max-w-2xl space-y-6">
       {/* Hero card */}
       <div className="rounded-2xl border border-slate-200 bg-white p-8 shadow-sm text-center">
         <div className="w-16 h-16 bg-blue-100 rounded-2xl flex items-center justify-center mx-auto mb-4">

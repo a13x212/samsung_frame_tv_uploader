@@ -3,44 +3,23 @@
 import { useState, useRef, useCallback } from "react";
 import type {
   DiscoveredTV,
-  TvConnection,
   UploadJob,
   MatteTypeId,
   MatteColorId,
 } from "@/lib/types";
-import { MATTE_TYPES, MATTE_COLORS } from "@/lib/types";
-import { uploadPhotos, disconnectTv } from "@/lib/api-client";
+import { MATTE_COLORS } from "@/lib/types";
+import { uploadPhotos } from "@/lib/api-client";
+import { buildMatteId, matteColorCss, matteLabel } from "@/lib/matte";
 import ErrorBanner from "@/components/ErrorBanner";
-
-// Padding per matte type — fraction of preview width (mirrors Samsung's display).
-const MATTE_TYPE_PADDING: Record<string, string> = {
-  none:       "0",
-  modernthin: "5%",
-  modern:     "10%",
-  modernwide: "16%",
-  flexible:   "10%",
-  shadowbox:  "10%",
-  panoramic:  "2% 4%",
-};
-
-function matteColorStyle(colorId: MatteColorId) {
-  const c = MATTE_COLORS.find((c) => c.id === colorId);
-  if (!c) return "#000";
-  return `rgb(${c.r},${c.g},${c.b})`;
-}
-
-/** TV API ID — "none" or "{type}_{color}" */
-function buildMatteId(type: MatteTypeId, color: MatteColorId): string {
-  return type === "none" ? "none" : `${type}_${color}`;
-}
+import FrameTvPreview from "@/components/matte/FrameTvPreview";
+import MattePicker from "@/components/matte/MattePicker";
 
 interface UploadStepProps {
   tv: DiscoveredTV;
-  connection: TvConnection | null;
   uploadJobs: UploadJob[];
   onUploadJobsUpdate: (jobs: UploadJob[]) => void;
-  onDisconnect: () => void;
-  onManage: () => void;
+  /** Switch the shell to the "On the TV" (library) view. */
+  onViewLibrary?: () => void;
 }
 
 interface PendingFile {
@@ -64,11 +43,9 @@ const MAX_FILES = 20;
 
 export default function UploadStep({
   tv,
-  connection,
   uploadJobs,
   onUploadJobsUpdate,
-  onDisconnect,
-  onManage,
+  onViewLibrary,
 }: UploadStepProps) {
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -201,40 +178,12 @@ export default function UploadStep({
     }
   };
 
-  const handleDisconnect = async () => {
-    await disconnectTv(tv.id);
-    onDisconnect();
-  };
-
   const uploadDone = uploadJobs.length > 0 && !uploading;
   const successCount = uploadJobs.filter((j) => j.phase === "done").length;
   const errorCount = uploadJobs.filter((j) => j.phase === "error").length;
 
   return (
-    <div className="space-y-5">
-      {/* Connected header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2.5">
-          <span className="flex h-2.5 w-2.5 rounded-full bg-green-500" />
-          <span className="font-medium text-slate-900">{tv.name}</span>
-          <span className="text-xs text-slate-400">connected</span>
-        </div>
-        <div className="flex items-center gap-3">
-          <button
-            onClick={onManage}
-            className="text-xs text-blue-600 hover:text-blue-700 transition-colors"
-          >
-            Manage Photos
-          </button>
-          <button
-            onClick={handleDisconnect}
-            className="text-xs text-slate-400 hover:text-slate-600 transition-colors"
-          >
-            Disconnect
-          </button>
-        </div>
-      </div>
-
+    <div className="mx-auto max-w-2xl space-y-5">
       {/* Drop zone */}
       {!uploading && uploadJobs.length === 0 && (
         <div
@@ -295,6 +244,7 @@ export default function UploadStep({
                   imageUrl={active.previewUrl}
                   matteType={activeMatteType}
                   matteColor={activeMatteColor}
+                  caption={`Preview on ${tv.name} · ${matteLabel(activeMatteType, activeMatteColor)}`}
                 />
                 {pendingFiles.length === 1 && (
                   <button
@@ -316,68 +266,18 @@ export default function UploadStep({
             const activeMatteType = active?.matteType ?? "none";
             const activeMatteColor = active?.matteColor ?? "polar";
             return (
-              <div className="space-y-3">
-                <div>
-                  <label className="text-xs font-medium text-slate-500 uppercase tracking-wide mb-2 block">
-                    Matte Style{pendingFiles.length > 1 && <span className="normal-case font-normal text-slate-400 ml-1">— photo {activeIdx + 1} of {pendingFiles.length}</span>}
-                  </label>
-                  <div className="grid grid-cols-4 gap-1.5">
-                    {MATTE_TYPES.map((opt) => (
-                      <button
-                        key={opt.id}
-                        onClick={() => setActiveMatteType(opt.id)}
-                        className={`flex flex-col items-center gap-1.5 p-2 rounded-xl border transition-all ${
-                          activeMatteType === opt.id
-                            ? "border-blue-500 bg-blue-50 ring-1 ring-blue-500"
-                            : "border-slate-200 bg-white hover:border-slate-300"
-                        }`}
-                      >
-                        <div className="w-full aspect-video rounded bg-black overflow-hidden relative">
-                          <div
-                            className="absolute inset-0 flex items-center justify-center"
-                            style={{
-                              background: opt.id === "none" ? "#111" : matteColorStyle(activeMatteColor),
-                              padding: MATTE_TYPE_PADDING[opt.id] ?? "0",
-                            }}
-                          >
-                            <div className="w-full h-full bg-slate-500 rounded-sm opacity-80" />
-                          </div>
-                        </div>
-                        <span className={`text-[10px] font-medium leading-tight text-center ${activeMatteType === opt.id ? "text-blue-700" : "text-slate-500"}`}>
-                          {opt.label}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {activeMatteType !== "none" && (
-                  <div>
-                    <label className="text-xs font-medium text-slate-500 uppercase tracking-wide mb-2 block">
-                      Matte Color
-                    </label>
-                    <div className="flex flex-wrap gap-1.5">
-                      {MATTE_COLORS.map((c) => (
-                        <button
-                          key={c.id}
-                          title={c.label}
-                          onClick={() => setActiveMatteColor(c.id)}
-                          className={`w-7 h-7 rounded-full border-2 transition-all ${
-                            activeMatteColor === c.id
-                              ? "border-blue-500 scale-110 shadow-md"
-                              : "border-transparent hover:border-slate-300"
-                          }`}
-                          style={{ background: `rgb(${c.r},${c.g},${c.b})` }}
-                        />
-                      ))}
-                    </div>
-                    <p className="text-xs text-slate-400 mt-1.5">
-                      {MATTE_COLORS.find((c) => c.id === activeMatteColor)?.label ?? ""}
-                      {" · "}
-                      <span className="font-mono">{buildMatteId(activeMatteType, activeMatteColor)}</span>
-                    </p>
-                  </div>
+              <div className="space-y-2">
+                {pendingFiles.length > 1 && (
+                  <p className="text-xs text-slate-500">
+                    Photo {activeIdx + 1} of {pendingFiles.length}
+                  </p>
                 )}
+                <MattePicker
+                  matteType={activeMatteType}
+                  matteColor={activeMatteColor}
+                  onTypeChange={setActiveMatteType}
+                  onColorChange={setActiveMatteColor}
+                />
               </div>
             );
           })()}
@@ -413,7 +313,7 @@ export default function UploadStep({
                       {matteColor && (
                         <span
                           className="absolute bottom-0.5 right-0.5 w-3 h-3 rounded-full border border-white/60"
-                          style={{ background: `rgb(${matteColor.r},${matteColor.g},${matteColor.b})` }}
+                          style={{ background: matteColorCss(matteColor.id) }}
                         />
                       )}
                       <button
@@ -483,15 +383,25 @@ export default function UploadStep({
           ))}
 
           {!uploading && (
-            <button
-              onClick={() => {
-                onUploadJobsUpdate([]);
-                setPendingFiles([]);
-              }}
-              className="w-full border border-slate-300 hover:border-slate-400 text-slate-700 font-medium py-2.5 rounded-xl transition-colors mt-2"
-            >
-              Upload More Photos
-            </button>
+            <div className="flex flex-col gap-2 mt-2 sm:flex-row">
+              {onViewLibrary && successCount > 0 && (
+                <button
+                  onClick={onViewLibrary}
+                  className="flex-1 bg-ink hover:bg-black text-white font-medium py-2.5 rounded-xl transition-colors"
+                >
+                  See photos on the TV
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  onUploadJobsUpdate([]);
+                  setPendingFiles([]);
+                }}
+                className="flex-1 border border-slate-300 hover:border-slate-400 text-slate-700 font-medium py-2.5 rounded-xl transition-colors"
+              >
+                Upload More Photos
+              </button>
+            </div>
           )}
         </div>
       )}
@@ -504,56 +414,6 @@ export default function UploadStep({
           onDismiss={() => setError(null)}
         />
       )}
-    </div>
-  );
-}
-
-function FrameTvPreview({
-  imageUrl,
-  matteType,
-  matteColor,
-}: {
-  imageUrl: string;
-  matteType: MatteTypeId;
-  matteColor: MatteColorId;
-}) {
-  const padding = MATTE_TYPE_PADDING[matteType] ?? "0";
-  const bg = matteType === "none" ? "#000" : matteColorStyle(matteColor);
-  const colorLabel = matteType !== "none"
-    ? (MATTE_COLORS.find((c) => c.id === matteColor)?.label ?? matteColor)
-    : null;
-  const typeLabel = MATTE_TYPES.find((t) => t.id === matteType)?.label ?? matteType;
-
-  return (
-    <div className="w-full">
-      {/* TV outer bezel */}
-      <div className="rounded-lg overflow-hidden shadow-xl" style={{ background: "#1a1a1a", padding: "6px 8px 18px 8px" }}>
-        {/* Screen area */}
-        <div className="w-full rounded-sm overflow-hidden" style={{ aspectRatio: "16/9", background: "#000" }}>
-          {/* Matte + image */}
-          <div
-            className="w-full h-full flex items-center justify-center transition-all duration-200"
-            style={{ background: bg, padding, boxSizing: "border-box" }}
-          >
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={imageUrl}
-              alt="Preview"
-              className="w-full h-full object-contain"
-              style={{ display: "block" }}
-            />
-          </div>
-        </div>
-        {/* TV stand hint */}
-        <div className="flex justify-center mt-1">
-          <div className="w-8 h-1 rounded-full bg-slate-700" />
-        </div>
-      </div>
-      <p className="text-center text-xs text-slate-400 mt-2">
-        {matteType === "none"
-          ? "No matte"
-          : `${typeLabel} · ${colorLabel}`}
-      </p>
     </div>
   );
 }

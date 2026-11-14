@@ -1,190 +1,241 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { DiscoveredTV, TvConnection, UploadJob } from "@/lib/types";
-import { getSession } from "@/lib/api-client";
+import { disconnectTv, getSession } from "@/lib/api-client";
 import DiscoverStep from "@/components/steps/DiscoverStep";
 import PairStep from "@/components/steps/PairStep";
 import UploadStep from "@/components/steps/UploadStep";
 import ManageStep from "@/components/steps/ManageStep";
+import ConfirmDialog from "@/components/ConfirmDialog";
+import ErrorBanner from "@/components/ErrorBanner";
+import AppHeader from "@/components/shell/AppHeader";
+import SetupHeader from "@/components/shell/SetupHeader";
+import BottomTabBar from "@/components/shell/BottomTabBar";
+import LoadingScreen from "@/components/shell/LoadingScreen";
+import { isKnownTv, rememberTv } from "@/components/shell/known-tvs";
+import type { AppView, SetupStep } from "@/components/shell/types";
 
-export type AppStep = "discover" | "pair" | "upload" | "manage";
+type Mode = "loading" | "setup" | "app";
 
-export interface AppState {
-  step: AppStep;
-  tvs: DiscoveredTV[];
-  selectedTv: DiscoveredTV | null;
-  connection: TvConnection | null;
-  uploadJobs: UploadJob[];
-}
+/** Content column shared by both modes (mockups: max 1376px, 32px gutters). */
+const CONTENT = "mx-auto w-full max-w-content px-4 py-5 sm:p-8";
 
 export default function Home() {
-  const [state, setState] = useState<AppState>({
-    step: "discover",
-    tvs: [],
-    selectedTv: null,
-    connection: null,
-    uploadJobs: [],
-  });
+  const [mode, setMode] = useState<Mode>("loading");
+  const [setupStep, setSetupStep] = useState<SetupStep>("discover");
+  const [view, setView] = useState<AppView>("library");
 
-  const setStep = (step: AppStep) =>
-    setState((s) => ({ ...s, step }));
+  const [tvs, setTvs] = useState<DiscoveredTV[]>([]);
+  const [selectedTv, setSelectedTv] = useState<DiscoveredTV | null>(null);
+  const [connection, setConnection] = useState<TvConnection | null>(null);
+  const [uploadJobs, setUploadJobs] = useState<UploadJob[]>([]);
+  const [photoCount, setPhotoCount] = useState<number | null>(null);
 
-  const setTvs = (tvs: DiscoveredTV[]) =>
-    setState((s) => ({ ...s, tvs }));
+  // Library is kept mounted while hidden; remount it after new uploads so it
+  // shows them the next time it is opened.
+  const [libraryKey, setLibraryKey] = useState(0);
+  const libraryStaleRef = useRef(false);
+  const doneCountRef = useRef(0);
 
-  const selectTv = (tv: DiscoveredTV) =>
-    setState((s) => ({ ...s, selectedTv: tv, step: "pair" }));
+  const [confirmDisconnect, setConfirmDisconnect] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
+  const [shellError, setShellError] = useState<{ error: string; hint: string } | null>(null);
 
-  const setConnection = (connection: TvConnection | null) =>
-    setState((s) => ({ ...s, connection }));
-
-  const setUploadJobs = (jobs: UploadJob[]) =>
-    setState((s) => ({ ...s, uploadJobs: jobs }));
-
-  const goToDiscover = () =>
-    setState((s) => ({
-      ...s,
-      step: "discover",
-      selectedTv: null,
-      connection: null,
-      uploadJobs: [],
-    }));
-
-  // Restore session on mount — skip discover/pair if a TV is already paired
+  // Restore session on mount. Until it resolves we show a neutral loading
+  // screen, never the Discover screen.
   useEffect(() => {
-    getSession().then((res) => {
-      if (!res.ok) return;
-      const { tvs, connections } = res.data;
-      const pairedConn = connections.find((c) => c.status === "paired");
-      if (!pairedConn) return;
-      const tv = tvs.find((t) => t.id === pairedConn.tvId);
-      if (!tv) return;
-      setState((s) => ({
-        ...s,
-        tvs,
-        selectedTv: tv,
-        connection: pairedConn,
-        step: "upload",
-      }));
-    });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    let cancelled = false;
+    getSession()
+      .then((res) => {
+        if (cancelled) return;
+        if (!res.ok) return setMode("setup");
+        const { tvs: knownTvs, connections } = res.data;
+        setTvs(knownTvs);
+        const paired = connections.find((c) => c.status === "paired");
+        const tv = paired && knownTvs.find((t) => t.id === paired.tvId);
+        if (!paired || !tv) return setMode("setup");
+        rememberTv(tv.id);
+        setSelectedTv(tv);
+        setConnection(paired);
+        setView("library");
+        setMode("app");
+      })
+      .catch(() => {
+        if (!cancelled) setMode("setup");
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  return (
-    <main className="min-h-screen flex flex-col items-center justify-start py-12 px-4">
-      {/* Header */}
-      <header className="w-full max-w-2xl mb-10">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center">
-            <svg
-              className="w-5 h-5 text-white"
-              fill="none"
-              viewBox="0 0 24 24"
-              strokeWidth={1.5}
-              stroke="currentColor"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3 21h18M3.75 3h16.5M4.5 3v18M19.5 3v18"
-              />
-            </svg>
-          </div>
-          <div>
-            <h1 className="text-xl font-semibold text-slate-900 leading-tight">
-              Frame TV Uploader
-            </h1>
-            <p className="text-sm text-slate-500">
-              Upload photos to your Samsung Frame TV
-            </p>
-          </div>
-        </div>
+  const selectTv = (tv: DiscoveredTV) => {
+    setSelectedTv(tv);
+    setConnection(null);
+    setSetupStep("pair");
+  };
 
-        {/* Step indicator */}
-        <StepIndicator currentStep={state.step} />
-      </header>
+  const backToDiscover = () => {
+    setSelectedTv(null);
+    setConnection(null);
+    setSetupStep("discover");
+  };
 
-      {/* Step content */}
-      <div className="w-full max-w-2xl">
-        {state.step === "discover" && (
-          <DiscoverStep
-            tvs={state.tvs}
-            onTvsFound={setTvs}
-            onSelectTv={selectTv}
-          />
-        )}
-        {state.step === "pair" && state.selectedTv && (
-          <PairStep
-            tv={state.selectedTv}
-            connection={state.connection}
-            onConnectionUpdate={setConnection}
-            onPaired={() => setStep("upload")}
-            onCancel={goToDiscover}
-          />
-        )}
-        {state.step === "upload" && state.selectedTv && (
-          <UploadStep
-            tv={state.selectedTv}
-            connection={state.connection}
-            uploadJobs={state.uploadJobs}
-            onUploadJobsUpdate={setUploadJobs}
-            onDisconnect={goToDiscover}
-            onManage={() => setStep("manage")}
-          />
-        )}
-        {state.step === "manage" && state.selectedTv && (
-          <ManageStep tv={state.selectedTv} onBack={() => setStep("upload")} />
-        )}
-      </div>
-    </main>
-  );
-}
+  const handlePaired = () => {
+    if (!selectedTv) return;
+    const returning = isKnownTv(selectedTv.id);
+    rememberTv(selectedTv.id);
+    setPhotoCount(null);
+    setView(returning ? "library" : "add");
+    setMode("app");
+  };
 
-function StepIndicator({ currentStep }: { currentStep: AppStep }) {
-  const steps: { id: AppStep; label: string }[] = [
-    { id: "discover", label: "Find TV" },
-    { id: "pair", label: "Connect" },
-    { id: "upload", label: "Upload" },
-  ];
+  const handleUploadJobsUpdate = useCallback((jobs: UploadJob[]) => {
+    setUploadJobs(jobs);
+    const done = jobs.filter((j) => j.phase === "done").length;
+    if (done > doneCountRef.current) libraryStaleRef.current = true;
+    doneCountRef.current = done;
+  }, []);
 
-  const currentIdx = steps.findIndex((s) => s.id === currentStep);
+  const changeView = useCallback((next: AppView) => {
+    if (next === "library" && libraryStaleRef.current) {
+      libraryStaleRef.current = false;
+      setLibraryKey((k) => k + 1);
+    }
+    setView(next);
+  }, []);
 
-  return (
-    <div className="flex items-center gap-2 mt-4">
-      {steps.map((step, idx) => (
-        <div key={step.id} className="flex items-center gap-2">
-          <div
-            className={`flex items-center gap-1.5 ${
-              idx < currentIdx
-                ? "text-blue-600"
-                : idx === currentIdx
-                ? "text-blue-700 font-medium"
-                : "text-slate-400"
-            }`}
-          >
-            <span
-              className={`w-5 h-5 rounded-full flex items-center justify-center text-xs font-semibold ${
-                idx < currentIdx
-                  ? "bg-blue-600 text-white"
-                  : idx === currentIdx
-                  ? "bg-blue-700 text-white"
-                  : "bg-slate-200 text-slate-400"
-              }`}
-            >
-              {idx < currentIdx ? "✓" : idx + 1}
-            </span>
-            <span className="text-sm">{step.label}</span>
-          </div>
-          {idx < steps.length - 1 && (
-            <div
-              className={`h-px w-8 ${
-                idx < currentIdx ? "bg-blue-400" : "bg-slate-200"
-              }`}
+  const handleDisconnectConfirmed = async () => {
+    if (!selectedTv) return;
+    setDisconnecting(true);
+    try {
+      const res = await disconnectTv(selectedTv.id);
+      if (!res.ok) {
+        setShellError({ error: res.error, hint: res.hint });
+        return;
+      }
+      setConfirmDisconnect(false);
+      setUploadJobs([]);
+      doneCountRef.current = 0;
+      libraryStaleRef.current = false;
+      setPhotoCount(null);
+      setShellError(null);
+      backToDiscover();
+      setMode("setup");
+    } catch {
+      setShellError({
+        error: "Couldn't disconnect",
+        hint: "Check that this device can reach the app, then try again.",
+      });
+    } finally {
+      setDisconnecting(false);
+    }
+  };
+
+  if (mode === "loading") return <LoadingScreen />;
+
+  if (mode === "setup") {
+    return (
+      <div className="min-h-screen">
+        <SetupHeader
+          step={setupStep}
+          tvName={selectedTv?.name}
+          onCancel={setupStep === "pair" ? backToDiscover : undefined}
+        />
+        <main className={CONTENT}>
+          {setupStep === "discover" && (
+            <DiscoverStep tvs={tvs} onTvsFound={setTvs} onSelectTv={selectTv} />
+          )}
+          {setupStep === "pair" && selectedTv && (
+            <PairStep
+              tv={selectedTv}
+              connection={connection}
+              onConnectionUpdate={setConnection}
+              onPaired={handlePaired}
+              onCancel={backToDiscover}
             />
           )}
+        </main>
+      </div>
+    );
+  }
+
+  // App mode: a TV is paired.
+  if (!selectedTv) return <LoadingScreen />;
+
+  return (
+    <div className="min-h-screen">
+      <AppHeader
+        tv={selectedTv}
+        view={view}
+        photoCount={photoCount}
+        onViewChange={changeView}
+        onDisconnect={() => {
+          setShellError(null);
+          setConfirmDisconnect(true);
+        }}
+      />
+
+      {/* Bottom padding on phones keeps content clear of the fixed tab bar. */}
+      <main className={`${CONTENT} pb-[calc(60px+env(safe-area-inset-bottom)+24px)] sm:pb-8`}>
+        {shellError && !confirmDisconnect && (
+          <div className="mb-5">
+            <ErrorBanner
+              error={shellError.error}
+              hint={shellError.hint}
+              onDismiss={() => setShellError(null)}
+            />
+          </div>
+        )}
+
+        {/* Both screens stay mounted so switching tabs keeps their state
+            (pending files, an upload in progress, selection). */}
+        <div hidden={view !== "library"}>
+          <ManageStep
+            key={`${selectedTv.id}:${libraryKey}`}
+            tv={selectedTv}
+            onPhotoCount={setPhotoCount}
+            onAddPhotos={() => changeView("add")}
+          />
         </div>
-      ))}
+        <div hidden={view !== "add"}>
+          <UploadStep
+            key={selectedTv.id}
+            tv={selectedTv}
+            uploadJobs={uploadJobs}
+            onUploadJobsUpdate={handleUploadJobsUpdate}
+            onViewLibrary={() => changeView("library")}
+          />
+        </div>
+      </main>
+
+      <BottomTabBar view={view} photoCount={photoCount} onViewChange={changeView} />
+
+      <ConfirmDialog
+        open={confirmDisconnect}
+        title={`Disconnect from ${selectedTv.name}?`}
+        body={
+          <>
+            <p className="m-0">
+              Photos already on the TV stay there. To reconnect, you will need to press
+              Allow on the TV remote again.
+            </p>
+            {shellError && (
+              <p className="m-0 mt-3 font-medium text-danger" role="alert">
+                {shellError.error}. {shellError.hint}
+              </p>
+            )}
+          </>
+        }
+        confirmLabel={disconnecting ? "Disconnecting…" : "Disconnect"}
+        destructive
+        busy={disconnecting}
+        onConfirm={handleDisconnectConfirmed}
+        onCancel={() => {
+          setConfirmDisconnect(false);
+          setShellError(null);
+        }}
+      />
     </div>
   );
 }

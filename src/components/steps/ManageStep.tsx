@@ -1,36 +1,22 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import type { DiscoveredTV, ArtPhoto, MatteTypeId, MatteColorId } from "@/lib/types";
 import { MATTE_TYPES, MATTE_COLORS } from "@/lib/types";
 import { listPhotos, thumbnailUrl, deletePhotos, changeMatte } from "@/lib/api-client";
+import { buildMatteId, parseMatteId, matteColorCss } from "@/lib/matte";
 import ErrorBanner from "@/components/ErrorBanner";
-
-function matteColorStyle(colorId: MatteColorId): string {
-  const c = MATTE_COLORS.find((c) => c.id === colorId);
-  return c ? `rgb(${c.r},${c.g},${c.b})` : "#000";
-}
-
-function buildMatteId(type: MatteTypeId, color: MatteColorId): string {
-  return type === "none" ? "none" : `${type}_${color}`;
-}
-
-/** Reverse of buildMatteId — "shadowbox_polar" -> { type: "shadowbox", color: "polar" } */
-function parseMatteId(matteId?: string): { type: MatteTypeId; color: MatteColorId } {
-  if (!matteId || matteId === "none") return { type: "none", color: "polar" };
-  const type = MATTE_TYPES.find((t) => matteId === t.id || matteId.startsWith(`${t.id}_`));
-  if (!type || type.id === "none") return { type: "none", color: "polar" };
-  const colorId = matteId.slice(type.id.length + 1);
-  const color = MATTE_COLORS.find((c) => c.id === colorId);
-  return { type: type.id, color: color?.id ?? "polar" };
-}
+import ConfirmDialog from "@/components/ConfirmDialog";
 
 interface ManageStepProps {
   tv: DiscoveredTV;
-  onBack: () => void;
+  /** Called whenever the number of photos on the TV is known or changes. */
+  onPhotoCount?: (n: number) => void;
+  /** Switch the shell to the "Add photos" view. */
+  onAddPhotos?: () => void;
 }
 
-export default function ManageStep({ tv, onBack }: ManageStepProps) {
+export default function ManageStep({ tv, onPhotoCount, onAddPhotos }: ManageStepProps) {
   const [photos, setPhotos] = useState<ArtPhoto[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<{ error: string; hint: string } | null>(null);
@@ -38,6 +24,12 @@ export default function ManageStep({ tv, onBack }: ManageStepProps) {
   const [deleting, setDeleting] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [savingMatte, setSavingMatte] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  // True once the photo list has been fetched successfully at least once.
+  const [loaded, setLoaded] = useState(false);
+
+  const onPhotoCountRef = useRef(onPhotoCount);
+  onPhotoCountRef.current = onPhotoCount;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -48,6 +40,7 @@ export default function ManageStep({ tv, onBack }: ManageStepProps) {
       setPhotos([]);
     } else {
       setPhotos(res.data.photos);
+      setLoaded(true);
     }
     setLoading(false);
   }, [tv.id]);
@@ -55,6 +48,10 @@ export default function ManageStep({ tv, onBack }: ManageStepProps) {
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    if (loaded) onPhotoCountRef.current?.(photos.length);
+  }, [loaded, photos.length]);
 
   const toggleSelected = (contentId: string) => {
     setSelected((prev) => {
@@ -68,10 +65,6 @@ export default function ManageStep({ tv, onBack }: ManageStepProps) {
   const handleDeleteSelected = async () => {
     if (selected.size === 0) return;
     const ids = [...selected];
-    const confirmed = window.confirm(
-      `Delete ${ids.length} photo${ids.length > 1 ? "s" : ""} from this TV? This can't be undone.`
-    );
-    if (!confirmed) return;
 
     setDeleting(true);
     setError(null);
@@ -83,6 +76,7 @@ export default function ManageStep({ tv, onBack }: ManageStepProps) {
       setSelected(new Set());
     }
     setDeleting(false);
+    setConfirmDelete(false);
   };
 
   const handleMatteSave = async (contentId: string, type: MatteTypeId, color: MatteColorId) => {
@@ -103,28 +97,14 @@ export default function ManageStep({ tv, onBack }: ManageStepProps) {
 
   return (
     <div className="space-y-5">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2.5">
-          <span className="flex h-2.5 w-2.5 rounded-full bg-green-500" />
-          <span className="font-medium text-slate-900">{tv.name}</span>
-          <span className="text-xs text-slate-400">Photos on TV</span>
-        </div>
-        <div className="flex items-center gap-3">
-          <button
-            onClick={load}
-            disabled={loading}
-            className="text-xs text-slate-400 hover:text-slate-600 transition-colors disabled:opacity-50"
-          >
-            Refresh
-          </button>
-          <button
-            onClick={onBack}
-            className="text-xs text-blue-600 hover:text-blue-700 transition-colors"
-          >
-            Back to Upload
-          </button>
-        </div>
+      <div className="flex justify-end">
+        <button
+          onClick={load}
+          disabled={loading}
+          className="text-xs text-slate-500 hover:text-slate-700 transition-colors disabled:opacity-50"
+        >
+          Refresh
+        </button>
       </div>
 
       {error && (
@@ -138,6 +118,16 @@ export default function ManageStep({ tv, onBack }: ManageStepProps) {
       {!loading && photos.length === 0 && !error && (
         <div className="text-center py-16 text-sm text-slate-400">
           No photos found in Art Mode on this TV.
+          {onAddPhotos && (
+            <div className="mt-3">
+              <button
+                onClick={onAddPhotos}
+                className="text-sm font-medium text-blue-600 hover:text-blue-700"
+              >
+                Add photos
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -158,7 +148,7 @@ export default function ManageStep({ tv, onBack }: ManageStepProps) {
                   Clear
                 </button>
                 <button
-                  onClick={handleDeleteSelected}
+                  onClick={() => setConfirmDelete(true)}
                   disabled={deleting}
                   className="text-xs font-medium text-red-600 hover:text-red-700 transition-colors disabled:opacity-50"
                 >
@@ -186,6 +176,17 @@ export default function ManageStep({ tv, onBack }: ManageStepProps) {
           </div>
         </>
       )}
+
+      <ConfirmDialog
+        open={confirmDelete}
+        title={`Delete ${selected.size} photo${selected.size === 1 ? "" : "s"} from this TV?`}
+        body="This can't be undone."
+        confirmLabel={deleting ? "Deleting…" : "Delete"}
+        destructive
+        busy={deleting}
+        onConfirm={handleDeleteSelected}
+        onCancel={() => setConfirmDelete(false)}
+      />
     </div>
   );
 }
@@ -258,7 +259,7 @@ function PhotoCard({
         {matteType !== "none" && (
           <span
             className="absolute bottom-1.5 left-1.5 w-3 h-3 rounded-full border border-white/70"
-            style={{ background: matteColorStyle(matteColor) }}
+            style={{ background: matteColorCss(matteColor) }}
           />
         )}
       </div>
