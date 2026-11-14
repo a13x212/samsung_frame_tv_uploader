@@ -95,7 +95,7 @@ export default function PairStep({
   const status = connection?.status ?? "connecting";
 
   return (
-    <div className="space-y-6">
+    <div className="mx-auto max-w-2xl space-y-6">
       <div className="rounded-2xl border border-slate-200 bg-white p-8 shadow-sm">
         <div className="text-center">
           {/* TV animation */}
