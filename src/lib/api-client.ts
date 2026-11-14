@@ -1,4 +1,5 @@
 import type {
+  ApiError,
   ApiResult,
   DiscoverData,
   DiscoveredTV,
@@ -68,6 +69,38 @@ export async function disconnectTv(
 
 // ─── Upload ───────────────────────────────────────────────────────────────────
 
+const UPLOAD_FAILED = "Upload request failed";
+
+/** Used when a refused upload has no readable `{ error, hint }` body. */
+const STATUS_FALLBACK: Record<number, string> = {
+  413: "The photos are too large to upload. Try fewer or smaller photos.",
+  429: "Too many uploads right now. Wait a minute and try again.",
+};
+
+/**
+ * Turn a refused upload response into a short message. The server refuses with
+ * the same `{ ok: false, error, hint }` body as every other route (rate limiter,
+ * cross-site guard, multer limits, route checks), so read it like the other
+ * callers do: "<error>. <hint>." Anything else (HTML from a proxy, empty body)
+ * falls back to a status-based or generic message.
+ */
+async function refusalMessage(res: Response): Promise<string> {
+  const fallback = STATUS_FALLBACK[res.status] ?? UPLOAD_FAILED;
+  if (!(res.headers.get("content-type") ?? "").includes("application/json")) return fallback;
+  try {
+    const body = (await res.json()) as Partial<ApiError> | null;
+    const clean = (s: unknown) =>
+      typeof s === "string" ? s.replace(/[<>]/g, "").trim().replace(/\.$/, "") : "";
+    const error = clean(body?.error);
+    if (!error) return fallback;
+    const hint = clean(body?.hint);
+    const msg = hint ? `${error}. ${hint}.` : `${error}.`;
+    return msg.length > 240 ? fallback : msg;
+  } catch {
+    return fallback;
+  }
+}
+
 /**
  * Upload photos to a paired TV.
  * Returns an async generator that yields UploadProgressEvent from the SSE stream.
@@ -98,7 +131,7 @@ export async function* uploadPhotos(
       fileName: "",
       phase: "error",
       progressPercent: 0,
-      error: "Upload request failed",
+      error: res.ok ? UPLOAD_FAILED : await refusalMessage(res),
     };
     yield err;
     return;
