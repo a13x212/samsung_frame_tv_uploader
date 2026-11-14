@@ -1,12 +1,17 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef, useId } from "react";
 import type { DiscoveredTV, ArtPhoto, MatteTypeId, MatteColorId } from "@/lib/types";
-import { MATTE_TYPES, MATTE_COLORS } from "@/lib/types";
 import { listPhotos, thumbnailUrl, deletePhotos, changeMatte } from "@/lib/api-client";
-import { buildMatteId, parseMatteId, matteColorCss } from "@/lib/matte";
+import { buildMatteId, parseMatteId } from "@/lib/matte";
 import ErrorBanner from "@/components/ErrorBanner";
 import ConfirmDialog from "@/components/ConfirmDialog";
+import PhotoTile, { PhotoTileSkeleton } from "@/components/library/PhotoTile";
+import SelectionInspector, { SelectionHint, Spinner } from "@/components/library/SelectionInspector";
+import type { ApplyProgress } from "@/components/library/SelectionInspector";
+import MobileSelectionBar from "@/components/library/MobileSelectionBar";
+import BottomSheet from "@/components/library/BottomSheet";
+import { plural } from "@/components/library/plural";
 
 interface ManageStepProps {
   tv: DiscoveredTV;
@@ -16,31 +21,70 @@ interface ManageStepProps {
   onAddPhotos?: () => void;
 }
 
+type Filter = "all" | "matte" | "none";
+type ApiErr = { error: string; hint: string };
+
+/** Pending (not yet applied) matte, tied to the photo it was initialised from. */
+interface PendingMatte {
+  forId: string;
+  type: MatteTypeId;
+  color: MatteColorId;
+}
+
+const NETWORK_ERROR: ApiErr = {
+  error: "Could not reach the app server",
+  hint: "Check that this device is still on the same network, then try again.",
+};
+
+const FOCUS = "focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent";
+
+const hasMatte = (p: ArtPhoto) => parseMatteId(p.matte_id).type !== "none";
+const normalisedMatteId = (p: ArtPhoto) => {
+  const { type, color } = parseMatteId(p.matte_id);
+  return buildMatteId(type, color);
+};
+
 export default function ManageStep({ tv, onPhotoCount, onAddPhotos }: ManageStepProps) {
   const [photos, setPhotos] = useState<ArtPhoto[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<{ error: string; hint: string } | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [deleting, setDeleting] = useState(false);
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [savingMatte, setSavingMatte] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [loadError, setLoadError] = useState<ApiErr | null>(null);
   // True once the photo list has been fetched successfully at least once.
   const [loaded, setLoaded] = useState(false);
+
+  const [filter, setFilter] = useState<Filter>("all");
+  // Ordered: the first id is the photo shown in the inspector preview.
+  const [selected, setSelected] = useState<string[]>([]);
+  const [pending, setPending] = useState<PendingMatte | null>(null);
+
+  const [progress, setProgress] = useState<ApplyProgress | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [actionError, setActionError] = useState<ApiErr | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [sheetOpen, setSheetOpen] = useState(false);
+
+  const asideTitleId = useId();
+  const sheetTitleId = useId();
 
   const onPhotoCountRef = useRef(onPhotoCount);
   onPhotoCountRef.current = onPhotoCount;
 
   const load = useCallback(async () => {
     setLoading(true);
-    setError(null);
-    const res = await listPhotos(tv.id);
-    if (!res.ok) {
-      setError({ error: res.error, hint: res.hint });
-      setPhotos([]);
-    } else {
-      setPhotos(res.data.photos);
-      setLoaded(true);
+    setLoadError(null);
+    try {
+      const res = await listPhotos(tv.id);
+      if (!res.ok) {
+        setLoadError({ error: res.error, hint: res.hint });
+      } else {
+        const list = res.data.photos;
+        setPhotos(list);
+        const ids = new Set(list.map((p) => p.content_id));
+        setSelected((prev) => prev.filter((id) => ids.has(id)));
+        setLoaded(true);
+      }
+    } catch {
+      setLoadError(NETWORK_ERROR);
     }
     setLoading(false);
   }, [tv.id]);
@@ -53,259 +97,433 @@ export default function ManageStep({ tv, onPhotoCount, onAddPhotos }: ManageStep
     if (loaded) onPhotoCountRef.current?.(photos.length);
   }, [loaded, photos.length]);
 
-  const toggleSelected = (contentId: string) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(contentId)) next.delete(contentId);
-      else next.add(contentId);
-      return next;
+  // The sheet only makes sense while something is selected.
+  useEffect(() => {
+    if (selected.length === 0) setSheetOpen(false);
+  }, [selected.length]);
+
+  // The sheet is phone-only; close it if the viewport grows past `sm`.
+  useEffect(() => {
+    if (!sheetOpen) return;
+    const mq = window.matchMedia("(min-width: 640px)");
+    const onChange = () => {
+      if (mq.matches) setSheetOpen(false);
+    };
+    onChange();
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, [sheetOpen]);
+
+  const byId = useMemo(() => new Map(photos.map((p) => [p.content_id, p])), [photos]);
+  const positionById = useMemo(
+    () => new Map(photos.map((p, i) => [p.content_id, i + 1])),
+    [photos]
+  );
+  const withMatteCount = useMemo(() => photos.filter(hasMatte).length, [photos]);
+  const visible = useMemo(
+    () =>
+      filter === "all"
+        ? photos
+        : photos.filter((p) => (filter === "matte" ? hasMatte(p) : !hasMatte(p))),
+    [photos, filter]
+  );
+  const selectedSet = useMemo(() => new Set(selected), [selected]);
+
+  // Pending matte: whatever the user picked for the current first photo, or
+  // else that photo's current matte. Nothing is written to `photos` until the
+  // TV confirms, so cancelling never leaves a stale matte on a tile.
+  const firstPhoto = selected.length > 0 ? byId.get(selected[0]) : undefined;
+  const current = firstPhoto ? parseMatteId(firstPhoto.matte_id) : null;
+  const pendingType = pending && pending.forId === firstPhoto?.content_id ? pending.type : current?.type ?? "none";
+  const pendingColor = pending && pending.forId === firstPhoto?.content_id ? pending.color : current?.color ?? "polar";
+  const pendingId = buildMatteId(pendingType, pendingColor);
+  const alreadyApplied =
+    selected.length > 0 &&
+    selected.every((id) => {
+      const p = byId.get(id);
+      return p ? normalisedMatteId(p) === pendingId : true;
     });
+
+  const applying = progress !== null;
+  const busy = applying || deleting;
+
+  const toggleSelected = useCallback((contentId: string) => {
+    setNotice(null);
+    setSelected((prev) =>
+      prev.includes(contentId) ? prev.filter((id) => id !== contentId) : [...prev, contentId]
+    );
+  }, []);
+
+  const clearSelection = () => {
+    setSelected([]);
+    setPending(null);
+    setActionError(null);
   };
 
-  const handleDeleteSelected = async () => {
-    if (selected.size === 0) return;
-    const ids = [...selected];
+  const setPendingType = (type: MatteTypeId) => {
+    if (firstPhoto) setPending({ forId: firstPhoto.content_id, type, color: pendingColor });
+  };
+  const setPendingColor = (color: MatteColorId) => {
+    if (firstPhoto) setPending({ forId: firstPhoto.content_id, type: pendingType, color });
+  };
 
-    setDeleting(true);
-    setError(null);
-    const res = await deletePhotos(tv.id, ids);
-    if (!res.ok) {
-      setError({ error: res.error, hint: res.hint });
+  // changeMatte is per photo: apply one at a time, update each tile as the TV
+  // confirms it, and keep only the failures selected so they can be retried.
+  const handleApply = async () => {
+    if (busy || selected.length === 0) return;
+    const ids = [...selected];
+    const matteId = pendingId;
+    const type = pendingType;
+    const color = pendingColor;
+    const failed: string[] = [];
+    let lastErr: ApiErr | null = null;
+
+    setActionError(null);
+    setNotice(null);
+    for (let i = 0; i < ids.length; i++) {
+      setProgress({ current: i + 1, total: ids.length });
+      const id = ids[i];
+      try {
+        const res = await changeMatte(tv.id, id, matteId);
+        if (res.ok) {
+          setPhotos((prev) => prev.map((p) => (p.content_id === id ? { ...p, matte_id: matteId } : p)));
+        } else {
+          failed.push(id);
+          lastErr = { error: res.error, hint: res.hint };
+        }
+      } catch {
+        failed.push(id);
+        lastErr = NETWORK_ERROR;
+      }
+    }
+    setProgress(null);
+
+    if (failed.length > 0) {
+      setSelected(failed);
+      // Keep the chosen matte for the retry even though the first photo changed.
+      setPending({ forId: failed[0], type, color });
+      const which = failed.length === ids.length ? "None of the" : `${failed.length} of ${ids.length}`;
+      setActionError({
+        error: `${which} ${ids.length === 1 ? "photo" : "photos"} could not be changed. ${
+          failed.length === 1 ? "It is" : "They are"
+        } still selected so you can try again.`,
+        hint: lastErr ? [lastErr.error, lastErr.hint].filter(Boolean).join(" ") : "",
+      });
     } else {
-      setPhotos((prev) => prev.filter((p) => !ids.includes(p.content_id)));
-      setSelected(new Set());
+      setSelected([]);
+      setPending(null);
+      setNotice(`Matte applied to ${plural(ids.length, "photo")}.`);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (selected.length === 0) return;
+    const ids = [...selected];
+    setDeleting(true);
+    setActionError(null);
+    setNotice(null);
+    try {
+      const res = await deletePhotos(tv.id, ids);
+      if (!res.ok) {
+        setActionError({ error: res.error, hint: res.hint });
+      } else {
+        const gone = new Set(ids);
+        setPhotos((prev) => prev.filter((p) => !gone.has(p.content_id)));
+        setSelected([]);
+        setPending(null);
+        setNotice(`Deleted ${plural(ids.length, "photo")} from the TV.`);
+      }
+    } catch {
+      setActionError(NETWORK_ERROR);
     }
     setDeleting(false);
     setConfirmDelete(false);
   };
 
-  const handleMatteSave = async (contentId: string, type: MatteTypeId, color: MatteColorId) => {
-    setSavingMatte(true);
-    setError(null);
-    const matteId = buildMatteId(type, color);
-    const res = await changeMatte(tv.id, contentId, matteId);
-    if (!res.ok) {
-      setError({ error: res.error, hint: res.hint });
-    } else {
-      setPhotos((prev) =>
-        prev.map((p) => (p.content_id === contentId ? { ...p, matte_id: matteId } : p))
-      );
-      setEditingId(null);
-    }
-    setSavingMatte(false);
+  const openDelete = () => {
+    setActionError(null);
+    setConfirmDelete(true);
   };
 
+  const inspectorProps = firstPhoto
+    ? {
+        count: selected.length,
+        previewUrl: thumbnailUrl(tv.id, firstPhoto.content_id),
+        matteType: pendingType,
+        matteColor: pendingColor,
+        onTypeChange: setPendingType,
+        onColorChange: setPendingColor,
+        alreadyApplied,
+        progress,
+        deleting,
+        error: actionError,
+        onDismissError: () => setActionError(null),
+        onApply: handleApply,
+        onDelete: openDelete,
+        onClear: clearSelection,
+      }
+    : null;
+
+  const showSkeleton = loading && !loaded;
+  const showInitialError = !loading && !loaded && loadError !== null;
+  const isEmpty = loaded && photos.length === 0;
+  const hasSelection = selected.length > 0;
+  const total = photos.length;
+
   return (
-    <div className="space-y-5">
-      <div className="flex justify-end">
-        <button
-          onClick={load}
-          disabled={loading}
-          className="text-xs text-slate-500 hover:text-slate-700 transition-colors disabled:opacity-50"
-        >
-          Refresh
-        </button>
-      </div>
+    <div className={`flex flex-wrap items-start gap-8 ${hasSelection ? "pb-20 sm:pb-0" : ""}`}>
+      <div className="flex min-w-0 flex-[999_1_560px] flex-col gap-4 sm:gap-5">
+        {/* Heading, filters, refresh */}
+        <div className="flex flex-wrap items-end justify-between gap-x-6 gap-y-3">
+          <div>
+            <h1 className="m-0 font-display text-2xl font-semibold tracking-[-0.01em] text-ink sm:text-[28px]">
+              On the TV
+            </h1>
+            <p className="m-0 mt-0.5 text-muted sm:mt-1">
+              {loaded ? (
+                <>
+                  {plural(total, "photo")} in Art Mode
+                  <span className="hidden sm:inline">, shown the way the TV frames them</span>
+                </>
+              ) : loading ? (
+                "Loading photos from the TV…"
+              ) : (
+                "Photos in Art Mode, shown the way the TV frames them"
+              )}
+            </p>
+          </div>
 
-      {error && (
-        <ErrorBanner error={error.error} hint={error.hint} onDismiss={() => setError(null)} />
-      )}
-
-      {loading && (
-        <div className="text-center py-16 text-sm text-slate-400">Loading photos…</div>
-      )}
-
-      {!loading && photos.length === 0 && !error && (
-        <div className="text-center py-16 text-sm text-slate-400">
-          No photos found in Art Mode on this TV.
-          {onAddPhotos && (
-            <div className="mt-3">
-              <button
-                onClick={onAddPhotos}
-                className="text-sm font-medium text-blue-600 hover:text-blue-700"
-              >
-                Add photos
-              </button>
-            </div>
-          )}
+          <div className="flex flex-wrap items-center gap-2">
+            {loaded && total > 0 && (
+              <div role="group" aria-label="Filter photos" className="flex flex-wrap gap-2">
+                <FilterChip label="All" count={total} active={filter === "all"} onClick={() => setFilter("all")} />
+                <FilterChip
+                  label="With matte"
+                  count={withMatteCount}
+                  active={filter === "matte"}
+                  onClick={() => setFilter("matte")}
+                />
+                <FilterChip
+                  label="No matte"
+                  count={total - withMatteCount}
+                  active={filter === "none"}
+                  onClick={() => setFilter("none")}
+                />
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={load}
+              disabled={loading || busy}
+              aria-label={loading ? "Refreshing from TV" : "Refresh from TV"}
+              title="Refresh from TV"
+              className={`flex h-11 w-11 items-center justify-center rounded-full border border-line-strong bg-surface text-ink hover:border-muted disabled:cursor-not-allowed disabled:opacity-60 sm:h-9 sm:w-9 ${FOCUS}`}
+            >
+              {loading ? (
+                <Spinner />
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                  <path d="M20 11a8 8 0 1 0-2.3 5.7" />
+                  <path d="M20 4v7h-7" />
+                </svg>
+              )}
+            </button>
+          </div>
         </div>
-      )}
 
-      {!loading && photos.length > 0 && (
-        <>
-          {/* Selection bar */}
-          <div className="flex items-center justify-between">
-            <span className="text-xs text-slate-500">
-              {photos.length} photo{photos.length > 1 ? "s" : ""}
-              {selected.size > 0 && ` · ${selected.size} selected`}
-            </span>
-            {selected.size > 0 && (
-              <div className="flex items-center gap-3">
+        <p role="status" className={notice ? "m-0 text-sm font-medium text-success" : "sr-only"}>
+          {notice ?? ""}
+        </p>
+
+        {loadError && (
+          <div className="flex flex-col gap-3">
+            <ErrorBanner
+              error={loadError.error}
+              hint={loadError.hint}
+              onDismiss={loaded ? () => setLoadError(null) : undefined}
+            />
+            {showInitialError && (
+              <div>
                 <button
-                  onClick={() => setSelected(new Set())}
-                  className="text-xs text-slate-400 hover:text-slate-600 transition-colors"
+                  type="button"
+                  onClick={load}
+                  className={`min-h-[44px] rounded-[10px] bg-ink px-5 font-semibold text-white hover:bg-black ${FOCUS}`}
                 >
-                  Clear
-                </button>
-                <button
-                  onClick={() => setConfirmDelete(true)}
-                  disabled={deleting}
-                  className="text-xs font-medium text-red-600 hover:text-red-700 transition-colors disabled:opacity-50"
-                >
-                  {deleting ? "Deleting…" : `Delete ${selected.size}`}
+                  Try again
                 </button>
               </div>
             )}
           </div>
+        )}
 
-          {/* Grid */}
-          <div className="grid grid-cols-3 sm:grid-cols-4 gap-3">
-            {photos.map((photo) => (
-              <PhotoCard
+        {/* Phone: action errors normally show inside the sheet; when it is
+            closed (e.g. delete from the selection bar) show them here. */}
+        {actionError && !sheetOpen && (
+          <div className="sm:hidden">
+            <ErrorBanner
+              error={actionError.error}
+              hint={actionError.hint}
+              onDismiss={() => setActionError(null)}
+            />
+          </div>
+        )}
+
+        {showSkeleton && (
+          <div aria-busy="true" aria-label="Loading photos" className={GRID}>
+            {Array.from({ length: 8 }, (_, i) => (
+              <PhotoTileSkeleton key={i} />
+            ))}
+          </div>
+        )}
+
+        {isEmpty && (
+          <div className="flex flex-col items-center gap-3 rounded-[14px] border border-dashed border-line-strong bg-surface px-6 py-14 text-center">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" className="text-muted" aria-hidden="true">
+              <rect x="3" y="5" width="18" height="13" rx="1" />
+              <path d="M9 21h6" />
+            </svg>
+            <h2 className="m-0 font-display text-lg font-semibold text-ink">No photos on this TV yet</h2>
+            <p className="m-0 max-w-sm text-sm text-muted">
+              Photos you add show up here in Art Mode, framed the way the TV will show them.
+            </p>
+            {onAddPhotos && (
+              <button
+                type="button"
+                onClick={onAddPhotos}
+                className={`mt-1 min-h-[44px] rounded-[10px] bg-ink px-5 font-semibold text-white hover:bg-black ${FOCUS}`}
+              >
+                Add photos
+              </button>
+            )}
+          </div>
+        )}
+
+        {loaded && total > 0 && visible.length === 0 && (
+          <div className="flex flex-col items-center gap-3 rounded-[14px] border border-line bg-surface px-6 py-12 text-center">
+            <p className="m-0 text-sm text-muted">
+              {filter === "matte" ? "None of the photos on this TV have a matte." : "Every photo on this TV has a matte."}
+            </p>
+            <button
+              type="button"
+              onClick={() => setFilter("all")}
+              className={`min-h-[44px] rounded-[10px] border border-line-strong bg-surface px-5 font-semibold text-ink hover:border-muted ${FOCUS}`}
+            >
+              Show all photos
+            </button>
+          </div>
+        )}
+
+        {loaded && visible.length > 0 && (
+          <div className={GRID}>
+            {visible.map((photo) => (
+              <PhotoTile
                 key={photo.content_id}
                 tvId={tv.id}
                 photo={photo}
-                isSelected={selected.has(photo.content_id)}
-                isEditing={editingId === photo.content_id}
-                savingMatte={savingMatte}
-                onToggleSelect={() => toggleSelected(photo.content_id)}
-                onEdit={() => setEditingId(editingId === photo.content_id ? null : photo.content_id)}
-                onMatteSave={(type, color) => handleMatteSave(photo.content_id, type, color)}
+                position={positionById.get(photo.content_id) ?? 0}
+                selected={selectedSet.has(photo.content_id)}
+                disabled={busy}
+                onToggle={toggleSelected}
               />
             ))}
           </div>
-        </>
+        )}
+      </div>
+
+      {/* Inspector: side column on wide screens, stacks below when narrow.
+          Phones use the selection bar + bottom sheet instead. */}
+      {loaded && total > 0 && (
+        <aside
+          aria-label="Selection"
+          className="hidden max-w-[400px] flex-[1_1_340px] flex-col rounded-[14px] border border-line bg-surface p-6 sm:flex lg:sticky lg:top-24 lg:max-h-[calc(100vh-7rem)] lg:overflow-y-auto"
+        >
+          {inspectorProps ? (
+            <SelectionInspector titleId={asideTitleId} {...inspectorProps} />
+          ) : (
+            <SelectionHint />
+          )}
+        </aside>
       )}
 
+      {/* Rendered before the sheet so, when both close in the same commit
+          (successful delete from the sheet), the dialog restores body
+          overflow first and the sheet's restore wins. */}
       <ConfirmDialog
         open={confirmDelete}
-        title={`Delete ${selected.size} photo${selected.size === 1 ? "" : "s"} from this TV?`}
-        body="This can't be undone."
+        title={`Delete ${plural(selected.length, "photo")} from this TV?`}
+        body="They are removed from Art Mode on the TV. This can't be undone."
         confirmLabel={deleting ? "Deleting…" : "Delete"}
         destructive
         busy={deleting}
-        onConfirm={handleDeleteSelected}
+        onConfirm={handleDelete}
         onCancel={() => setConfirmDelete(false)}
       />
+
+      {hasSelection && !sheetOpen && (
+        <MobileSelectionBar
+          count={selected.length}
+          progress={progress}
+          busy={busy}
+          onChangeMatte={() => setSheetOpen(true)}
+          onDelete={openDelete}
+        />
+      )}
+
+      <BottomSheet
+        open={sheetOpen && inspectorProps !== null}
+        labelledBy={sheetTitleId}
+        onClose={() => setSheetOpen(false)}
+        busy={busy}
+        suspended={confirmDelete}
+      >
+        {inspectorProps && (
+          <SelectionInspector
+            titleId={sheetTitleId}
+            {...inspectorProps}
+            headerExtra={
+              <button
+                type="button"
+                onClick={() => setSheetOpen(false)}
+                disabled={busy}
+                aria-label="Close"
+                className={`flex h-11 w-11 items-center justify-center rounded-full text-ink hover:bg-ground disabled:opacity-50 ${FOCUS}`}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            }
+          />
+        )}
+      </BottomSheet>
     </div>
   );
 }
 
-function PhotoCard({
-  tvId,
-  photo,
-  isSelected,
-  isEditing,
-  savingMatte,
-  onToggleSelect,
-  onEdit,
-  onMatteSave,
+const GRID =
+  "grid grid-cols-2 gap-x-3 gap-y-4 sm:grid-cols-[repeat(auto-fill,minmax(190px,1fr))] sm:gap-x-5 sm:gap-y-6";
+
+function FilterChip({
+  label,
+  count,
+  active,
+  onClick,
 }: {
-  tvId: string;
-  photo: ArtPhoto;
-  isSelected: boolean;
-  isEditing: boolean;
-  savingMatte: boolean;
-  onToggleSelect: () => void;
-  onEdit: () => void;
-  onMatteSave: (type: MatteTypeId, color: MatteColorId) => void;
+  label: string;
+  count: number;
+  active: boolean;
+  onClick: () => void;
 }) {
-  const initial = parseMatteId(photo.matte_id);
-  const [matteType, setMatteType] = useState<MatteTypeId>(initial.type);
-  const [matteColor, setMatteColor] = useState<MatteColorId>(initial.color);
-
   return (
-    <div className="space-y-1.5">
-      <div
-        className={`relative aspect-square rounded-xl overflow-hidden bg-slate-100 cursor-pointer transition-all ${
-          isSelected ? "ring-2 ring-blue-500 ring-offset-1" : "hover:ring-1 hover:ring-slate-300"
-        }`}
-        onClick={onToggleSelect}
-      >
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={thumbnailUrl(tvId, photo.content_id)}
-          alt={photo.content_id}
-          loading="lazy"
-          className="w-full h-full object-cover"
-        />
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onToggleSelect();
-          }}
-          className={`absolute top-1.5 left-1.5 w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors ${
-            isSelected ? "bg-blue-600 border-blue-600" : "bg-black/30 border-white/80"
-          }`}
-        >
-          {isSelected && (
-            <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={3} stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
-            </svg>
-          )}
-        </button>
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onEdit();
-          }}
-          className="absolute bottom-1.5 right-1.5 w-6 h-6 bg-black/60 hover:bg-black/80 rounded-full flex items-center justify-center"
-          title="Change matte"
-        >
-          <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931z" />
-          </svg>
-        </button>
-        {matteType !== "none" && (
-          <span
-            className="absolute bottom-1.5 left-1.5 w-3 h-3 rounded-full border border-white/70"
-            style={{ background: matteColorCss(matteColor) }}
-          />
-        )}
-      </div>
-
-      {isEditing && (
-        <div className="rounded-xl border border-slate-200 bg-white p-2.5 space-y-2">
-          <div className="grid grid-cols-4 gap-1">
-            {MATTE_TYPES.map((opt) => (
-              <button
-                key={opt.id}
-                onClick={() => setMatteType(opt.id)}
-                title={opt.label}
-                className={`aspect-square rounded-md border text-[8px] font-medium flex items-center justify-center transition-all ${
-                  matteType === opt.id
-                    ? "border-blue-500 bg-blue-50 text-blue-700"
-                    : "border-slate-200 text-slate-500 hover:border-slate-300"
-                }`}
-              >
-                {opt.label.slice(0, 3)}
-              </button>
-            ))}
-          </div>
-          {matteType !== "none" && (
-            <div className="flex flex-wrap gap-1">
-              {MATTE_COLORS.map((c) => (
-                <button
-                  key={c.id}
-                  title={c.label}
-                  onClick={() => setMatteColor(c.id)}
-                  className={`w-4 h-4 rounded-full border-2 transition-all ${
-                    matteColor === c.id ? "border-blue-500 scale-110" : "border-transparent"
-                  }`}
-                  style={{ background: `rgb(${c.r},${c.g},${c.b})` }}
-                />
-              ))}
-            </div>
-          )}
-          <button
-            onClick={() => onMatteSave(matteType, matteColor)}
-            disabled={savingMatte}
-            className="w-full text-[10px] font-medium bg-blue-600 hover:bg-blue-700 text-white rounded-md py-1 transition-colors disabled:opacity-50"
-          >
-            {savingMatte ? "Saving…" : "Apply"}
-          </button>
-        </div>
-      )}
-    </div>
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onClick}
+      className={`min-h-[44px] rounded-full border px-4 font-medium sm:min-h-[36px] sm:px-3.5 ${FOCUS} ${
+        active ? "border-ink bg-ink text-white" : "border-line-strong bg-surface text-ink hover:border-muted"
+      }`}
+    >
+      {label} <span className={active ? "" : "text-muted"}>{count}</span>
+    </button>
   );
 }
