@@ -15,6 +15,7 @@ import BottomTabBar from "@/components/shell/BottomTabBar";
 import LoadingScreen from "@/components/shell/LoadingScreen";
 import { isKnownTv, rememberTv } from "@/components/shell/known-tvs";
 import type { AppView, SetupStep } from "@/components/shell/types";
+import { useBlockStrayFileDrops } from "@/hooks/useBlockStrayFileDrops";
 
 type Mode = "loading" | "setup" | "app";
 
@@ -41,6 +42,9 @@ export default function Home() {
   const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
   const [shellError, setShellError] = useState<{ error: string; hint: string } | null>(null);
+
+  // A file dropped outside the Add photos drop area must not open in the tab.
+  useBlockStrayFileDrops();
 
   // Restore session on mount. Until it resolves we show a neutral loading
   // screen, never the Discover screen.
