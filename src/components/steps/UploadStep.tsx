@@ -1,18 +1,28 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
-import type {
-  DiscoveredTV,
-  UploadJob,
-  MatteTypeId,
-  MatteColorId,
-} from "@/lib/types";
-import { MATTE_COLORS } from "@/lib/types";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import type { DiscoveredTV, UploadJob, MatteTypeId, MatteColorId } from "@/lib/types";
+import { MAX_UPLOAD_FILES } from "@/lib/types";
 import { uploadPhotos } from "@/lib/api-client";
-import { buildMatteId, matteColorCss, matteLabel } from "@/lib/matte";
+import { buildMatteId, matteLabel, DEFAULT_MATTE_COLOR } from "@/lib/matte";
 import ErrorBanner from "@/components/ErrorBanner";
 import FrameTvPreview from "@/components/matte/FrameTvPreview";
 import MattePicker from "@/components/matte/MattePicker";
+import DropZone from "@/components/upload/DropZone";
+import Filmstrip from "@/components/upload/Filmstrip";
+import SkippedNotice from "@/components/upload/SkippedNotice";
+import UploadJobList, { type JobPreview } from "@/components/upload/UploadJobList";
+import {
+  ACCEPT_ATTR,
+  applyUploadEvent,
+  countFinished,
+  createMatchState,
+  failUnfinished,
+  initialJobs,
+  partitionFiles,
+  type SkippedFiles,
+} from "@/components/upload/upload-events";
+import { PANEL, PRIMARY_BUTTON, SECONDARY_BUTTON } from "@/components/upload/styles";
 
 interface UploadStepProps {
   tv: DiscoveredTV;
@@ -23,23 +33,20 @@ interface UploadStepProps {
 }
 
 interface PendingFile {
+  /** Stable client id; also used as the UploadJob.jobId for this file. */
+  id: string;
   file: File;
   previewUrl: string;
   matteType: MatteTypeId;
   matteColor: MatteColorId;
 }
 
-const ACCEPTED_TYPES = [
-  "image/jpeg",
-  "image/png",
-  "image/webp",
-  "image/heic",
-  "image/heif",
-  "image/tiff",
-  "image/gif",
-];
+// Ids only need to be unique within this page. (crypto.randomUUID needs a
+// secure context, and the app is usually opened over plain http on the LAN.)
+let idSeq = 0;
+const nextId = () => `photo-${Date.now().toString(36)}-${++idSeq}`;
 
-const MAX_FILES = 20;
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
 export default function UploadStep({
   tv,
@@ -47,428 +54,474 @@ export default function UploadStep({
   onUploadJobsUpdate,
   onViewLibrary,
 }: UploadStepProps) {
-  const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+  /** Photos in the composer (not yet sent, or sent and failed). */
+  const [items, setItems] = useState<PendingFile[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
-  // Index of the file shown in the preview / whose matte is being edited.
-  const [activeIdx, setActiveIdx] = useState(0);
-  // Global defaults — new files inherit these; changing them also updates the active file.
-  const [defaultMatteType, setDefaultMatteType] = useState<MatteTypeId>("none");
-  const [defaultMatteColor, setDefaultMatteColor] = useState<MatteColorId>("polar");
-  const [dragOver, setDragOver] = useState(false);
+  /** The photos in the current / last send; drives the progress and summary views. */
+  const [batch, setBatch] = useState<PendingFile[] | null>(null);
+  const [skipped, setSkipped] = useState<SkippedFiles | null>(null);
   const [error, setError] = useState<{ error: string; hint: string } | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [dragActive, setDragActive] = useState(false);
 
-  const addFiles = useCallback((newFiles: File[]) => {
-    const valid = newFiles.filter(
-      (f) => ACCEPTED_TYPES.includes(f.type) || f.name.match(/\.(heic|heif)$/i)
+  const inputRef = useRef<HTMLInputElement>(null);
+  const dragDepth = useRef(0);
+  /** Every object URL still alive, so unmount can revoke them all. */
+  const liveUrls = useRef(new Set<string>());
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    const urls = liveUrls.current;
+    return () => {
+      mounted.current = false;
+      urls.forEach((u) => URL.revokeObjectURL(u));
+      urls.clear();
+    };
+  }, []);
+
+  const revoke = (pf: PendingFile) => {
+    URL.revokeObjectURL(pf.previewUrl);
+    liveUrls.current.delete(pf.previewUrl);
+  };
+
+  const view: "empty" | "compose" | "uploading" | "finished" = uploading
+    ? "uploading"
+    : batch && uploadJobs.length > 0
+    ? "finished"
+    : items.length > 0
+    ? "compose"
+    : "empty";
+
+  const active = items.find((i) => i.id === activeId) ?? items[0] ?? null;
+  const activeIndex = active ? items.indexOf(active) : -1;
+
+  // ─── Choosing files ──────────────────────────────────────────────────────
+
+  const openPicker = () => inputRef.current?.click();
+
+  /** Drop the finished batch: revoke previews of photos no longer in the composer. */
+  const clearBatch = useCallback(() => {
+    if (batch) {
+      const kept = new Set(items.map((i) => i.id));
+      batch.filter((b) => !kept.has(b.id)).forEach(revoke);
+    }
+    setBatch(null);
+    onUploadJobsUpdate([]);
+  }, [batch, items, onUploadJobsUpdate]);
+
+  const addFiles = (files: File[]) => {
+    if (uploading || files.length === 0) return;
+    const { accepted, skipped: skippedNow } = partitionFiles(files, items.length);
+    setSkipped(
+      skippedNow.unsupported.length || skippedNow.overLimit.length ? skippedNow : null
     );
+    if (accepted.length === 0) return;
 
-    setPendingFiles((prev) => {
-      // New files inherit the current defaults so the batch looks consistent,
-      // but each file can be individually overridden via the matte picker.
-      const combined = [
-        ...prev,
-        ...valid.map((file) => ({
-          file,
-          previewUrl: URL.createObjectURL(file),
-          matteType: defaultMatteType,
-          matteColor: defaultMatteColor,
-        })),
-      ];
-      if (combined.length > MAX_FILES) {
-        combined.slice(MAX_FILES).forEach((pf) => URL.revokeObjectURL(pf.previewUrl));
-        return combined.slice(0, MAX_FILES);
-      }
-      return combined;
+    // New photos start with no matte; "Use this matte on all" copies one across.
+    const added: PendingFile[] = accepted.map((file) => {
+      const previewUrl = URL.createObjectURL(file);
+      liveUrls.current.add(previewUrl);
+      return { id: nextId(), file, previewUrl, matteType: "none", matteColor: DEFAULT_MATTE_COLOR };
     });
-  }, [defaultMatteType, defaultMatteColor]);
-
-  const removeFile = (index: number) => {
-    setPendingFiles((prev) => {
-      URL.revokeObjectURL(prev[index].previewUrl);
-      return prev.filter((_, i) => i !== index);
-    });
-    setActiveIdx((prev) => Math.max(0, prev > index ? prev - 1 : Math.min(prev, pendingFiles.length - 2)));
-  };
-
-  /** Update the matte for the active file and persist as the new default. */
-  const setActiveMatteType = (type: MatteTypeId) => {
-    setDefaultMatteType(type);
-    setPendingFiles((prev) =>
-      prev.map((pf, i) => i === activeIdx ? { ...pf, matteType: type } : pf)
-    );
-  };
-
-  const setActiveMatteColor = (color: MatteColorId) => {
-    setDefaultMatteColor(color);
-    setPendingFiles((prev) =>
-      prev.map((pf, i) => i === activeIdx ? { ...pf, matteColor: color } : pf)
-    );
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setDragOver(false);
-    const files = Array.from(e.dataTransfer.files);
-    addFiles(files);
+    setItems((prev) => [...prev, ...added]);
+    setActiveId(added[0].id);
   };
 
   const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
-    addFiles(files);
-    // Reset input so the same file can be re-added
+    // Reset so choosing the same file again still fires onChange.
     e.target.value = "";
+    if (view === "finished") clearBatch();
+    addFiles(files);
   };
 
-  const startUpload = async () => {
-    if (pendingFiles.length === 0) return;
+  // Whole-page drag and drop. A depth counter avoids flicker when the pointer
+  // crosses child elements (each fires its own dragenter / dragleave).
+  const hasFiles = (e: React.DragEvent) => Array.from(e.dataTransfer.types).includes("Files");
+
+  const onDragEnter = (e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth.current += 1;
+    if (!uploading) setDragActive(true);
+  };
+  const onDragOver = (e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault(); // required for drop to fire, and stops the browser opening the file
+    e.dataTransfer.dropEffect = uploading ? "none" : "copy";
+  };
+  const onDragLeave = (e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragActive(false);
+  };
+  const onDrop = (e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDragActive(false);
+    if (uploading) return;
+    if (view === "finished") clearBatch();
+    addFiles(Array.from(e.dataTransfer.files));
+  };
+
+  // ─── Editing ─────────────────────────────────────────────────────────────
+
+  const removeActive = () => {
+    if (!active) return;
+    const idx = items.indexOf(active);
+    const neighbour = items[idx + 1] ?? items[idx - 1] ?? null;
+    revoke(active);
+    setItems((prev) => prev.filter((i) => i.id !== active.id));
+    setActiveId(neighbour?.id ?? null);
+  };
+
+  const patchActive = (patch: Partial<Pick<PendingFile, "matteType" | "matteColor">>) => {
+    if (!active) return;
+    setItems((prev) => prev.map((i) => (i.id === active.id ? { ...i, ...patch } : i)));
+  };
+
+  const applyToAll = () => {
+    if (!active) return;
+    const { matteType, matteColor } = active;
+    setItems((prev) => prev.map((i) => ({ ...i, matteType, matteColor })));
+  };
+
+  const allMatchActive =
+    !!active &&
+    items.every(
+      (i) =>
+        buildMatteId(i.matteType, i.matteColor) === buildMatteId(active.matteType, active.matteColor)
+    );
+
+  // ─── Sending ─────────────────────────────────────────────────────────────
+
+  const startUpload = async (list: PendingFile[]) => {
+    if (list.length === 0 || uploading) return;
     setUploading(true);
     setError(null);
+    setSkipped(null);
+    setBatch(list);
 
-    // Initialise all jobs as queued — use a mutable ref so each SSE event
-    // updates the accumulated state rather than re-mapping the original snapshot
-    // (stale-closure fix: mapping over `jobs` each time would overwrite previous
-    // updates and leave earlier files stuck at "queued").
-    let currentJobs: UploadJob[] = pendingFiles.map((pf) => ({
-      jobId: `pending-${pf.file.name}`,
-      fileName: pf.file.name,
-      fileSize: pf.file.size,
-      phase: "queued",
-      progressPercent: 0,
-      contentId: null,
-      error: null,
-    }));
-    onUploadJobsUpdate(currentJobs);
+    const push = (next: UploadJob[]) => {
+      if (mounted.current) onUploadJobsUpdate(next);
+    };
 
+    // The server sends files strictly in request order and gives each one a new
+    // jobId; see upload-events.ts for why order-based binding is unambiguous.
+    const match = createMatchState(list.map((pf) => pf.id));
+    let jobs = initialJobs(list);
+    push(jobs);
+
+    let interrupted = false;
     try {
       const gen = uploadPhotos(
         tv.id,
-        pendingFiles.map((pf) => pf.file),
-        pendingFiles.map((pf) => buildMatteId(pf.matteType, pf.matteColor))
+        list.map((pf) => pf.file),
+        list.map((pf) => buildMatteId(pf.matteType, pf.matteColor))
       );
-
       for await (const event of gen) {
         if ("done" in event) break;
-
-        currentJobs = currentJobs.map((j) => {
-          if (j.fileName === event.fileName || j.jobId === event.jobId) {
-            return {
-              ...j,
-              jobId: event.jobId,
-              phase: event.phase,
-              progressPercent: event.progressPercent,
-              contentId: event.contentId ?? j.contentId,
-              error: event.error ?? null,
-            };
-          }
-          return j;
-        });
-        onUploadJobsUpdate(currentJobs);
+        jobs = applyUploadEvent(match, jobs, event);
+        push(jobs);
       }
-    } catch (e) {
-      setError({
-        error: "Upload failed",
-        hint: "Check your Wi-Fi connection and try again.",
-      });
-    } finally {
-      setUploading(false);
-      pendingFiles.forEach((pf) => URL.revokeObjectURL(pf.previewUrl));
-      setPendingFiles([]);
-      setActiveIdx(0);
+    } catch {
+      interrupted = true;
     }
+
+    // Anything the stream never finished (connection dropped, server stopped
+    // early) counts as failed so it stays in the composer for a retry.
+    const settled = failUnfinished(
+      jobs,
+      interrupted
+        ? "Not sent: the connection to the uploader was lost."
+        : "Not sent: the upload stopped before this photo."
+    );
+    if (settled.some((j, i) => j !== jobs[i])) push(settled);
+
+    if (!mounted.current) return;
+    if (interrupted) {
+      setError({
+        error: "The upload was interrupted",
+        hint: "Check that this device is on the same Wi-Fi as the TV, then retry the photos that didn't send.",
+      });
+    }
+
+    // Keep failed and never-attempted photos (with their mattes); drop the sent
+    // ones. Their previews stay alive for the summary until the batch is cleared.
+    const sent = new Set(settled.filter((j) => j.phase === "done").map((j) => j.jobId));
+    setItems((prev) => prev.filter((i) => !sent.has(i.id)));
+    setActiveId(list.find((pf) => !sent.has(pf.id))?.id ?? null);
+    setUploading(false);
   };
 
-  const uploadDone = uploadJobs.length > 0 && !uploading;
-  const successCount = uploadJobs.filter((j) => j.phase === "done").length;
-  const errorCount = uploadJobs.filter((j) => j.phase === "error").length;
+  const retryFailed = () => {
+    const retry = items;
+    clearBatch();
+    void startUpload(retry);
+  };
+
+  const addMoreAfterSend = () => {
+    clearBatch();
+    openPicker();
+  };
+
+  // ─── Derived ─────────────────────────────────────────────────────────────
+
+  const previews = useMemo(() => {
+    const m = new Map<string, JobPreview>();
+    for (const pf of batch ?? []) m.set(pf.id, pf);
+    return m;
+  }, [batch]);
+
+  const counts = countFinished(uploadJobs);
+  const total = uploadJobs.length;
+  const currentNumber = Math.min(counts.finished + 1, total);
+  const overallPercent =
+    total === 0
+      ? 0
+      : Math.round(
+          uploadJobs.reduce(
+            (sum, j) => sum + (j.phase === "done" || j.phase === "error" ? 100 : j.progressPercent),
+            0
+          ) / total
+        );
+  const minutes = Math.max(1, Math.ceil(items.length * 0.5));
+
+  // ─── Render ──────────────────────────────────────────────────────────────
+
+  const subtitle =
+    view === "compose"
+      ? items.length === 1
+        ? "1 photo ready. Set its matte, then send it."
+        : `${items.length} photos ready. Pick one to set its matte.`
+      : view === "uploading"
+      ? `Sending to ${tv.name}.`
+      : view === "finished"
+      ? `Finished sending to ${tv.name}.`
+      : `Choose photos to show in Art Mode on ${tv.name}.`;
 
   return (
-    <div className="mx-auto max-w-2xl space-y-5">
-      {/* Drop zone */}
-      {!uploading && uploadJobs.length === 0 && (
-        <div
-          onDragOver={(e) => {
-            e.preventDefault();
-            setDragOver(true);
-          }}
-          onDragLeave={() => setDragOver(false)}
-          onDrop={handleDrop}
-          onClick={() => fileInputRef.current?.click()}
-          className={`rounded-2xl border-2 border-dashed p-10 cursor-pointer transition-all text-center ${
-            dragOver
-              ? "border-blue-500 bg-blue-50"
-              : "border-slate-300 bg-white hover:border-blue-400 hover:bg-slate-50"
-          }`}
-        >
-          <svg
-            className="w-10 h-10 mx-auto mb-3 text-slate-400"
-            fill="none"
-            viewBox="0 0 24 24"
-            strokeWidth={1.5}
-            stroke="currentColor"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"
+    <div
+      className="relative flex min-h-[60vh] flex-col gap-5"
+      onDragEnter={onDragEnter}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
+      {/* The one file input, shared by the drop zone, the add-more tile and
+          "Add more photos". */}
+      <input
+        ref={inputRef}
+        type="file"
+        multiple
+        accept={ACCEPT_ATTR}
+        onChange={handleFileInput}
+        className="hidden"
+        tabIndex={-1}
+        aria-hidden="true"
+      />
+
+      <div className="flex flex-wrap items-end justify-between gap-x-6 gap-y-3">
+        <div>
+          <h1 className="m-0 font-display text-[28px] font-semibold tracking-[-0.01em] text-ink">
+            Add photos
+          </h1>
+          <p className="m-0 mt-1 text-muted">{subtitle}</p>
+        </div>
+        {view === "compose" && (
+          <p className="m-0 text-[13px] text-muted">
+            JPEG, PNG, HEIC, WebP · up to {MAX_UPLOAD_FILES} · resized to fit the TV
+          </p>
+        )}
+      </div>
+
+      {skipped && <SkippedNotice skipped={skipped} onDismiss={() => setSkipped(null)} />}
+
+      {error && (
+        <ErrorBanner error={error.error} hint={error.hint} onDismiss={() => setError(null)} />
+      )}
+
+      {view === "empty" && <DropZone onBrowse={openPicker} dragActive={dragActive} tvName={tv.name} />}
+
+      {view === "compose" && active && (
+        <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(340px,400px)] lg:gap-8">
+          <div className="flex min-w-0 flex-col gap-4">
+            <FrameTvPreview
+              size="lg"
+              imageUrl={active.previewUrl}
+              matteType={active.matteType}
+              matteColor={active.matteColor}
+              alt={`Preview of ${active.file.name} on ${tv.name}`}
+              caption={`Preview on ${tv.name} · ${matteLabel(active.matteType, active.matteColor)}`}
             />
-          </svg>
-          <p className="font-medium text-slate-700 mb-1">
-            {dragOver ? "Drop photos here" : "Drag photos here or click to browse"}
-          </p>
-          <p className="text-sm text-slate-400">
-            JPEG, PNG, HEIC, WebP · Up to {MAX_FILES} photos · Auto-resized
-          </p>
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            accept={ACCEPTED_TYPES.join(",")}
-            onChange={handleFileInput}
-            className="hidden"
-          />
-        </div>
-      )}
-
-      {/* Pending files — matte preview + picker */}
-      {pendingFiles.length > 0 && !uploading && (
-        <div className="space-y-4">
-          {/* Frame TV mockup — shows the active file's preview */}
-          {(() => {
-            const active = pendingFiles[activeIdx] ?? pendingFiles[0];
-            const activeMatteType = active?.matteType ?? "none";
-            const activeMatteColor = active?.matteColor ?? "polar";
-            return (
-              <div className="relative">
-                <FrameTvPreview
-                  imageUrl={active.previewUrl}
-                  matteType={activeMatteType}
-                  matteColor={activeMatteColor}
-                  caption={`Preview on ${tv.name} · ${matteLabel(activeMatteType, activeMatteColor)}`}
-                />
-                {pendingFiles.length === 1 && (
-                  <button
-                    onClick={() => removeFile(0)}
-                    className="absolute top-2 right-2 w-6 h-6 bg-black/60 hover:bg-black/80 rounded-full flex items-center justify-center"
-                  >
-                    <svg className="w-3.5 h-3.5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                    </svg>
-                  </button>
-                )}
-              </div>
-            );
-          })()}
-
-          {/* Matte picker — edits the active file */}
-          {(() => {
-            const active = pendingFiles[activeIdx] ?? pendingFiles[0];
-            const activeMatteType = active?.matteType ?? "none";
-            const activeMatteColor = active?.matteColor ?? "polar";
-            return (
-              <div className="space-y-2">
-                {pendingFiles.length > 1 && (
-                  <p className="text-xs text-slate-500">
-                    Photo {activeIdx + 1} of {pendingFiles.length}
-                  </p>
-                )}
-                <MattePicker
-                  matteType={activeMatteType}
-                  matteColor={activeMatteColor}
-                  onTypeChange={setActiveMatteType}
-                  onColorChange={setActiveMatteColor}
-                />
-              </div>
-            );
-          })()}
-
-          {/* Thumbnail strip — click to edit that file's matte */}
-          {pendingFiles.length > 1 && (
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-slate-500">
-                  {pendingFiles.length} photo{pendingFiles.length > 1 ? "s" : ""} selected · tap a photo to edit its matte
-                  {pendingFiles.length >= MAX_FILES && (
-                    <span className="ml-1.5 text-amber-600 font-medium">(max {MAX_FILES})</span>
-                  )}
-                </span>
-              </div>
-              <div className="flex gap-2 overflow-x-auto pb-1">
-                {pendingFiles.map((pf, i) => {
-                  const isActive = i === activeIdx;
-                  const matteColor = pf.matteType !== "none"
-                    ? MATTE_COLORS.find((c) => c.id === pf.matteColor)
-                    : null;
-                  return (
-                    <div
-                      key={i}
-                      onClick={() => setActiveIdx(i)}
-                      className={`relative flex-shrink-0 group w-16 h-16 rounded-lg overflow-hidden bg-slate-100 cursor-pointer transition-all ${
-                        isActive ? "ring-2 ring-blue-500 ring-offset-1" : "opacity-70 hover:opacity-100"
-                      }`}
-                    >
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img src={pf.previewUrl} alt={pf.file.name} className="w-full h-full object-cover" />
-                      {/* Matte color dot */}
-                      {matteColor && (
-                        <span
-                          className="absolute bottom-0.5 right-0.5 w-3 h-3 rounded-full border border-white/60"
-                          style={{ background: matteColorCss(matteColor.id) }}
-                        />
-                      )}
-                      <button
-                        onClick={(e) => { e.stopPropagation(); removeFile(i); }}
-                        className="absolute top-0.5 right-0.5 w-4 h-4 bg-black/60 hover:bg-black/80 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                      >
-                        <svg className="w-2.5 h-2.5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                        </svg>
-                      </button>
-                    </div>
-                  );
-                })}
-                {pendingFiles.length < MAX_FILES && (
-                  <button
-                    onClick={() => fileInputRef.current?.click()}
-                    className="flex-shrink-0 w-16 h-16 rounded-lg border-2 border-dashed border-slate-300 hover:border-blue-400 flex items-center justify-center transition-colors"
-                  >
-                    <svg className="w-5 h-5 text-slate-400" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-                    </svg>
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            accept={ACCEPTED_TYPES.join(",")}
-            onChange={handleFileInput}
-            className="hidden"
-          />
-
-          <button
-            onClick={startUpload}
-            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 rounded-xl transition-colors"
-          >
-            Upload {pendingFiles.length} Photo{pendingFiles.length > 1 ? "s" : ""} to TV
-            {pendingFiles.length > 1 && (
-              <span className="block text-xs text-blue-200 font-normal mt-0.5">
-                Uploaded one at a time · ~{Math.ceil(pendingFiles.length * 0.5)} min
-              </span>
-            )}
-          </button>
-        </div>
-      )}
-
-      {/* Upload progress */}
-      {(uploading || uploadDone) && uploadJobs.length > 0 && (
-        <div className="space-y-3">
-          <div className="flex items-center justify-between">
-            <p className="text-sm font-medium text-slate-600">
-              {uploading
-                ? `Uploading ${uploadJobs.filter((j) => j.phase === "done").length + 1} of ${uploadJobs.length}…`
-                : `Done — ${successCount} uploaded${errorCount > 0 ? `, ${errorCount} failed` : ""}`}
-            </p>
-            {uploading && uploadJobs.length > 1 && (
-              <span className="text-xs text-slate-400">uploading one at a time</span>
+            <Filmstrip
+              items={items.map((i) => ({
+                id: i.id,
+                name: i.file.name,
+                previewUrl: i.previewUrl,
+                matteType: i.matteType,
+                matteColor: i.matteColor,
+              }))}
+              activeId={active.id}
+              onSelect={setActiveId}
+              onAddMore={openPicker}
+              canAddMore={items.length < MAX_UPLOAD_FILES}
+            />
+            {items.length >= MAX_UPLOAD_FILES && (
+              <p className="m-0 text-[13px] text-muted">
+                That&apos;s the {MAX_UPLOAD_FILES}-photo limit for one send. Send these, then add more.
+              </p>
             )}
           </div>
 
-          {uploadJobs.map((job) => (
-            <UploadJobRow key={job.jobId} job={job} />
-          ))}
-
-          {!uploading && (
-            <div className="flex flex-col gap-2 mt-2 sm:flex-row">
-              {onViewLibrary && successCount > 0 && (
-                <button
-                  onClick={onViewLibrary}
-                  className="flex-1 bg-ink hover:bg-black text-white font-medium py-2.5 rounded-xl transition-colors"
-                >
-                  See photos on the TV
-                </button>
-              )}
+          <aside aria-label="Matte for this photo" className={`flex flex-col gap-5 p-5 sm:p-6 ${PANEL}`}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <h2 className="m-0 font-display text-lg font-semibold text-ink">
+                  Photo {activeIndex + 1} of {items.length}
+                </h2>
+                <p className="m-0 mt-0.5 truncate text-[13px] text-muted" title={active.file.name}>
+                  {active.file.name}
+                </p>
+              </div>
               <button
-                onClick={() => {
-                  onUploadJobsUpdate([]);
-                  setPendingFiles([]);
-                }}
-                className="flex-1 border border-slate-300 hover:border-slate-400 text-slate-700 font-medium py-2.5 rounded-xl transition-colors"
+                type="button"
+                onClick={removeActive}
+                className="-mr-2 min-h-[44px] flex-none rounded-lg px-3 font-medium text-danger hover:bg-ground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
               >
-                Upload More Photos
+                Remove<span className="sr-only"> {active.file.name}</span>
               </button>
             </div>
-          )}
+
+            <MattePicker
+              matteType={active.matteType}
+              matteColor={active.matteColor}
+              onTypeChange={(matteType) => patchActive({ matteType })}
+              onColorChange={(matteColor) => patchActive({ matteColor })}
+            />
+
+            {items.length > 1 && (
+              <div className="flex flex-col gap-2">
+                <button
+                  type="button"
+                  onClick={applyToAll}
+                  disabled={allMatchActive}
+                  className={SECONDARY_BUTTON}
+                >
+                  {allMatchActive
+                    ? `All ${items.length} photos use this matte`
+                    : `Use this matte on all ${items.length} photos`}
+                </button>
+                <p className="m-0 text-center text-xs text-muted">
+                  Each photo keeps its own matte. New photos start with no matte.
+                </p>
+              </div>
+            )}
+
+            <div className="flex flex-col gap-2.5 border-t border-line pt-5">
+              <button type="button" onClick={() => void startUpload(items)} className={PRIMARY_BUTTON}>
+                Send {plural(items.length, "photo", "photos")} to {tv.name}
+              </button>
+              <p className="m-0 text-center text-xs text-muted">
+                Sent one at a time · about {plural(minutes, "minute", "minutes")}
+              </p>
+            </div>
+          </aside>
         </div>
       )}
 
-      {/* Error */}
-      {error && (
-        <ErrorBanner
-          error={error.error}
-          hint={error.hint}
-          onDismiss={() => setError(null)}
-        />
+      {view === "uploading" && (
+        <section aria-labelledby="sending-heading" className={`flex flex-col gap-5 p-5 sm:p-6 ${PANEL}`}>
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+              <h2 id="sending-heading" className="m-0 font-display text-lg font-semibold text-ink" aria-live="polite">
+                Sending {currentNumber} of {total}
+              </h2>
+              <span className="text-[13px] text-muted">
+                {counts.finished} finished · one at a time
+              </span>
+            </div>
+            <div
+              role="progressbar"
+              aria-label="Overall progress"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={overallPercent}
+              className="h-2 overflow-hidden rounded-full bg-ground"
+            >
+              <div
+                className="h-full rounded-full bg-ink transition-[width] duration-300"
+                style={{ width: `${overallPercent}%` }}
+              />
+            </div>
+            <p className="m-0 text-[13px] text-muted">
+              Keep this page open until it finishes. You can look at the On the TV tab meanwhile.
+            </p>
+          </div>
+          <UploadJobList jobs={uploadJobs} previews={previews} />
+        </section>
       )}
-    </div>
-  );
-}
 
-function UploadJobRow({ job }: { job: UploadJob }) {
-  const phaseLabel: Record<string, string> = {
-    queued:      "Waiting…",
-    processing:  "Preparing…",
-    negotiating: "Connecting…",
-    transferring:"Sending…",
-    done:        "Done",
-    error:       "Failed",
-  };
+      {view === "finished" && (
+        <section aria-labelledby="finished-heading" className={`flex flex-col gap-5 p-5 sm:p-6 ${PANEL}`}>
+          <div className="flex flex-col gap-1" role="status">
+            <h2 id="finished-heading" className="m-0 font-display text-lg font-semibold text-ink">
+              {counts.failed === 0
+                ? `${plural(counts.done, "photo", "photos")} sent to ${tv.name}`
+                : counts.done === 0
+                ? "No photos were sent"
+                : `${counts.done} sent, ${counts.failed} not sent`}
+            </h2>
+            {counts.failed > 0 && (
+              <p className="m-0 text-muted">
+                {items.length > 0
+                  ? `${counts.failed === 1 ? "The photo that didn't send is" : "The photos that didn't send are"} kept with ${counts.failed === 1 ? "its matte" : "their mattes"}, so you can try again.`
+                  : "Check that the TV is on and in Art Mode, then try again."}
+              </p>
+            )}
+          </div>
 
-  return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4">
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-sm font-medium text-slate-800 truncate max-w-[70%]">
-          {job.fileName}
-        </span>
-        <span
-          className={`text-xs font-medium ${
-            job.phase === "done"
-              ? "text-green-600"
-              : job.phase === "error"
-              ? "text-red-500"
-              : "text-blue-500"
-          }`}
-        >
-          {phaseLabel[job.phase] ?? job.phase}
-        </span>
-      </div>
+          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+            {onViewLibrary && counts.done > 0 && (
+              <button
+                type="button"
+                onClick={onViewLibrary}
+                className={`${PRIMARY_BUTTON} min-h-[44px] sm:w-auto`}
+              >
+                See photos on the TV
+              </button>
+            )}
+            {counts.failed > 0 && items.length > 0 && (
+              <button
+                type="button"
+                onClick={retryFailed}
+                className={
+                  counts.done > 0 ? SECONDARY_BUTTON : `${PRIMARY_BUTTON} min-h-[44px] sm:w-auto`
+                }
+              >
+                Retry failed ({items.length})
+              </button>
+            )}
+            <button type="button" onClick={addMoreAfterSend} className={SECONDARY_BUTTON}>
+              Add more photos
+            </button>
+          </div>
 
-      {/* Progress bar */}
-      <div className="h-1.5 rounded-full bg-slate-100 overflow-hidden">
+          <UploadJobList jobs={uploadJobs} previews={previews} />
+        </section>
+      )}
+
+      {dragActive && view !== "empty" && view !== "uploading" && (
         <div
-          className={`h-full rounded-full transition-all duration-300 ${
-            job.phase === "done"
-              ? "bg-green-500"
-              : job.phase === "error"
-              ? "bg-red-400"
-              : "bg-blue-500"
-          }`}
-          style={{ width: `${job.progressPercent}%` }}
-        />
-      </div>
-
-      {job.phase === "error" && job.error && (
-        <p className="text-xs text-red-500 mt-1.5">{job.error}</p>
-      )}
-
-      {job.phase === "done" && job.contentId && (
-        <p className="text-xs text-slate-400 mt-1.5">
-          Saved to Art Mode · ID: {job.contentId}
-        </p>
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 z-10 flex items-start justify-center rounded-[14px] border-2 border-dashed border-accent bg-accent-tint/70 pt-24"
+        >
+          <span className="rounded-full bg-surface px-4 py-2 font-semibold text-ink shadow">
+            Drop to add {items.length > 0 ? "more " : ""}photos
+          </span>
+        </div>
       )}
     </div>
   );

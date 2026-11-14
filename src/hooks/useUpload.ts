@@ -3,6 +3,14 @@
 import { useState, useCallback } from "react";
 import type { UploadJob, MatteId } from "@/lib/types";
 import { uploadPhotos } from "@/lib/api-client";
+import {
+  applyUploadEvent,
+  createMatchState,
+  failUnfinished,
+} from "@/components/upload/upload-events";
+
+// Not used by the app shell (UploadStep drives uploads itself); kept for reuse.
+// Events are matched to files by order, never by file name: see upload-events.ts.
 
 export function useUpload(tvId: string | null) {
   const [jobs, setJobs] = useState<UploadJob[]>([]);
@@ -16,9 +24,11 @@ export function useUpload(tvId: string | null) {
       setIsUploading(true);
       setUploadError(null);
 
-      // Initialise jobs
-      const initialJobs: UploadJob[] = files.map((f) => ({
-        jobId: `pending-${f.name}-${Date.now()}`,
+      // Initialise jobs. jobId is a stable per-file client id, so two files with
+      // the same name never collide.
+      const stamp = Date.now().toString(36);
+      let current: UploadJob[] = files.map((f, i) => ({
+        jobId: `file-${stamp}-${i}`,
         fileName: f.name,
         fileSize: f.size,
         phase: "queued",
@@ -26,31 +36,20 @@ export function useUpload(tvId: string | null) {
         contentId: null,
         error: null,
       }));
-      setJobs(initialJobs);
+      setJobs(current);
+      const match = createMatchState(current.map((j) => j.jobId));
 
       try {
         const gen = uploadPhotos(tvId, files, matteIds);
 
         for await (const event of gen) {
           if ("done" in event) break;
-
-          setJobs((prev) =>
-            prev.map((j) => {
-              if (j.fileName === event.fileName || j.jobId === event.jobId) {
-                return {
-                  ...j,
-                  jobId: event.jobId,
-                  phase: event.phase,
-                  progressPercent: event.progressPercent,
-                  contentId: event.contentId ?? j.contentId,
-                  error: event.error ?? null,
-                };
-              }
-              return j;
-            })
-          );
+          current = applyUploadEvent(match, current, event);
+          setJobs(current);
         }
+        setJobs(failUnfinished(current, "Not sent: the upload stopped before this photo."));
       } catch {
+        setJobs(failUnfinished(current, "Not sent: the connection was lost."));
         setUploadError("Upload failed. Check your Wi-Fi and try again.");
       } finally {
         setIsUploading(false);
