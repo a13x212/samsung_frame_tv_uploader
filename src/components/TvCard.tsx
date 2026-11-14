@@ -1,67 +1,70 @@
 import type { DiscoveredTV } from "@/lib/types";
+import { PRIMARY_BUTTON, SECONDARY_BUTTON } from "@/components/setup/styles";
 
 interface TvCardProps {
   tv: DiscoveredTV;
   onSelect: (tv: DiscoveredTV) => void;
 }
 
+const FOUND_VIA: Record<DiscoveredTV["discoveredVia"], string> = {
+  ssdp: "Found automatically",
+  scan: "Found by network scan",
+  manual: "Added by IP address",
+};
+
+/** One discovered TV with its details and a Connect action. */
 export default function TvCard({ tv, onSelect }: TvCardProps) {
+  const detailsId = `tv-${tv.id}-details`;
   return (
-    <button
-      onClick={() => onSelect(tv)}
-      className="w-full text-left rounded-xl border border-slate-200 bg-white p-5 shadow-sm hover:border-blue-400 hover:shadow-md transition-all group"
+    <div
+      className={`flex flex-col gap-4 rounded-xl border bg-surface p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5 ${
+        tv.frameSupported ? "border-line" : "border-line-strong"
+      }`}
     >
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          {/* TV icon */}
-          <div className="w-12 h-12 rounded-lg bg-slate-100 flex items-center justify-center group-hover:bg-blue-50 transition-colors">
-            <svg
-              className="w-7 h-7 text-slate-500 group-hover:text-blue-600 transition-colors"
-              fill="none"
-              viewBox="0 0 24 24"
-              strokeWidth={1.5}
-              stroke="currentColor"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M6 20.25h12m-7.5-3v3m3-3v3m-10.125-3h17.25c.621 0 1.125-.504 1.125-1.125V4.875c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125z"
-              />
-            </svg>
-          </div>
-
-          <div>
-            <p className="font-medium text-slate-900">{tv.name}</p>
-            <div className="flex items-center gap-2 mt-0.5">
-              {tv.modelYear > 0 && (
-                <span className="text-xs text-slate-500">{tv.modelYear}</span>
-              )}
-              {tv.frameSupported && (
-                <span className="text-xs bg-blue-50 text-blue-700 px-1.5 py-0.5 rounded-md font-medium">
-                  Frame TV
-                </span>
-              )}
-              <span className="text-xs text-slate-400">
-                via {tv.discoveredVia === "manual" ? "manual entry" : tv.discoveredVia.toUpperCase()}
-              </span>
-            </div>
-          </div>
-        </div>
-
-        <svg
-          className="w-5 h-5 text-slate-400 group-hover:text-blue-500 transition-colors"
-          fill="none"
-          viewBox="0 0 24 24"
-          strokeWidth={1.5}
-          stroke="currentColor"
+      <div className="flex min-w-0 items-start gap-4">
+        <span
+          aria-hidden="true"
+          className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-lg bg-wall text-ink"
         >
-          <path
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            d="M8.25 4.5l7.5 7.5-7.5 7.5"
-          />
-        </svg>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+            <rect x="3" y="5" width="18" height="14" rx="1" />
+            <rect x="7.5" y="9" width="9" height="6" />
+          </svg>
+        </span>
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <h3 className="m-0 break-words font-sans text-[15px] font-semibold text-ink">{tv.name}</h3>
+            {tv.frameSupported ? (
+              <span className="rounded-md bg-accent-tint px-1.5 py-0.5 text-xs font-medium text-accent">
+                Frame TV
+              </span>
+            ) : (
+              <span className="rounded-md border border-danger-line px-1.5 py-0.5 text-xs font-medium text-danger">
+                Not a Frame TV
+              </span>
+            )}
+          </div>
+          <p id={detailsId} className="m-0 mt-1 text-[13px] text-muted">
+            <span className="[font-variant-numeric:tabular-nums]">{tv.ip}</span>
+            {tv.modelYear > 0 && <> · {tv.modelYear} model</>}
+            {" · "}
+            {FOUND_VIA[tv.discoveredVia]}
+          </p>
+          {!tv.frameSupported && (
+            <p className="m-0 mt-1 text-[13px] text-ink">
+              This TV doesn&apos;t report Art Mode, so photos may not show as art.
+            </p>
+          )}
+        </div>
       </div>
-    </button>
+      <button
+        type="button"
+        onClick={() => onSelect(tv)}
+        aria-describedby={detailsId}
+        className={`${tv.frameSupported ? PRIMARY_BUTTON : SECONDARY_BUTTON} w-full flex-shrink-0 sm:w-auto`}
+      >
+        Connect<span className="sr-only"> to {tv.name}</span>
+      </button>
+    </div>
   );
 }

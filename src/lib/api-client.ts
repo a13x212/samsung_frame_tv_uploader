@@ -24,8 +24,18 @@ async function apiFetch<T>(
 
 // ─── Discovery ────────────────────────────────────────────────────────────────
 
-export async function discoverTvs(): Promise<ApiResult<DiscoverData>> {
-  return apiFetch<DiscoverData>("/api/tv/discover", { method: "POST" });
+/**
+ * Scan the network for TVs, or, with `manualIp`, probe and add the TV at that
+ * address. Either way the response lists every TV the server knows about.
+ */
+export async function discoverTvs(
+  options: { manualIp?: string } = {}
+): Promise<ApiResult<DiscoverData>> {
+  const manualIp = options.manualIp?.trim();
+  return apiFetch<DiscoverData>("/api/tv/discover", {
+    method: "POST",
+    ...(manualIp ? { body: JSON.stringify({ manualIp }) } : {}),
+  });
 }
 
 export async function listTvs(): Promise<ApiResult<{ tvs: DiscoveredTV[] }>> {

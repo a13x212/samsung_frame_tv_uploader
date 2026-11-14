@@ -1,10 +1,13 @@
 "use client";
 
 import { useState } from "react";
-import type { DiscoveredTV } from "@/lib/types";
+import type { ApiResult, DiscoverData, DiscoveredTV } from "@/lib/types";
 import { discoverTvs } from "@/lib/api-client";
 import TvCard from "@/components/TvCard";
 import ErrorBanner from "@/components/ErrorBanner";
+import ManualIpForm from "@/components/setup/ManualIpForm";
+import Spinner from "@/components/setup/Spinner";
+import { PRIMARY_BUTTON } from "@/components/setup/styles";
 
 interface DiscoverStepProps {
   tvs: DiscoveredTV[];
@@ -20,17 +23,22 @@ export default function DiscoverStep({
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<{ error: string; hint: string } | null>(null);
   const [hasScanned, setHasScanned] = useState(false);
-  const [manualIp, setManualIp] = useState("");
-  const [showManual, setShowManual] = useState(false);
-  const [manualLoading, setManualLoading] = useState(false);
-  const [manualError, setManualError] = useState<string | null>(null);
 
   const scan = async () => {
     setScanning(true);
     setError(null);
     setHasScanned(false);
 
-    const result = await discoverTvs();
+    let result: ApiResult<DiscoverData>;
+    try {
+      result = await discoverTvs();
+    } catch {
+      result = {
+        ok: false,
+        error: "Couldn't search",
+        hint: "This device couldn't reach the uploader. Check its connection and try again.",
+      };
+    }
     setScanning(false);
     setHasScanned(true);
 
@@ -38,208 +46,124 @@ export default function DiscoverStep({
       setError({ error: result.error, hint: result.hint });
       return;
     }
-
     onTvsFound(result.data.tvs);
-
-    if (result.data.tvs.length === 0) {
-      setError({
-        error: "No Frame TVs found",
-        hint: "Make sure your TV is on and connected to the same Wi-Fi network.",
-      });
-    }
   };
 
-  const addManual = async () => {
-    if (!manualIp.trim()) return;
-    setManualLoading(true);
-    setManualError(null);
-
-    try {
-      const res = await fetch("/api/tv/discover", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ manualIp: manualIp.trim() }),
-      });
-      const data = await res.json();
-      if (!data.ok) {
-        setManualError(data.hint || "Could not reach TV at that IP address.");
-      } else {
-        onTvsFound(data.data.tvs);
-        if (data.data.tvs.length === 0) {
-          setManualError("No Samsung Frame TV found at that IP. Double-check the address.");
-        } else {
-          setShowManual(false);
-          setManualIp("");
-        }
-      }
-    } catch {
-      setManualError("Network error. Make sure you are on the same Wi-Fi as your TV.");
-    } finally {
-      setManualLoading(false);
-    }
-  };
+  const noResults = hasScanned && !error && tvs.length === 0;
+  const announcement = scanning
+    ? "Searching your network for TVs."
+    : error
+      ? ""
+      : hasScanned
+        ? tvs.length === 0
+          ? "No TVs found."
+          : `${tvs.length === 1 ? "1 TV" : `${tvs.length} TVs`} found.`
+        : "";
 
   return (
-    <div className="mx-auto max-w-2xl space-y-6">
-      {/* Hero card */}
-      <div className="rounded-2xl border border-slate-200 bg-white p-8 shadow-sm text-center">
-        <div className="w-16 h-16 bg-blue-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
-          <svg
-            className="w-9 h-9 text-blue-600"
-            fill="none"
-            viewBox="0 0 24 24"
-            strokeWidth={1.5}
-            stroke="currentColor"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M6 20.25h12m-7.5-3v3m3-3v3m-10.125-3h17.25c.621 0 1.125-.504 1.125-1.125V4.875c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125z"
-            />
-          </svg>
-        </div>
-
-        <h2 className="text-2xl font-semibold text-slate-900 mb-2">
-          Find Your Frame TV
-        </h2>
-        <p className="text-slate-500 mb-6 max-w-sm mx-auto">
-          We'll automatically search for Samsung Frame TVs on your Wi-Fi network.
-        </p>
-
-        <button
-          onClick={scan}
-          disabled={scanning}
-          className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-medium px-8 py-3 rounded-xl transition-colors"
-        >
-          {scanning ? (
-            <>
-              <Spinner />
-              Searching…
-            </>
-          ) : (
-            <>
-              <svg
-                className="w-5 h-5"
-                fill="none"
-                viewBox="0 0 24 24"
-                strokeWidth={1.5}
-                stroke="currentColor"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  d="M8.288 15.038a5.25 5.25 0 017.424 0M5.106 11.856c3.807-3.808 9.98-3.808 13.788 0M1.924 8.674c5.565-5.565 14.587-5.565 20.152 0M12.53 18.22l-.53.53-.53-.53a.75.75 0 011.06 0z"
-                />
-              </svg>
-              Find My TV
-            </>
-          )}
-        </button>
-
-        {scanning && (
-          <p className="text-sm text-slate-400 mt-3">
-            Looking for Samsung Frame TVs on your network…
+    <div className="mx-auto grid w-full max-w-[1180px] gap-6 py-1 sm:gap-8 sm:py-4 lg:grid-cols-[minmax(0,420px)_minmax(0,1fr)] lg:grid-rows-[auto_1fr] lg:gap-x-14 lg:py-12">
+      {/* Intro + primary action */}
+      <div className="flex flex-col gap-5 lg:col-start-1 lg:row-start-1">
+        <div>
+          <h1 className="m-0 text-[28px] leading-[1.15] tracking-[-0.01em] text-ink sm:text-[34px]">
+            Find your Frame TV
+          </h1>
+          <p className="mb-0 mt-3 text-base text-muted">
+            Turn the TV on and make sure it&apos;s on the same Wi-Fi as this device. The search
+            usually takes a few seconds.
           </p>
-        )}
+        </div>
+        <div>
+          <button
+            type="button"
+            onClick={scan}
+            disabled={scanning}
+            className={`${PRIMARY_BUTTON} w-full sm:w-auto`}
+          >
+            {scanning ? (
+              <>
+                <Spinner />
+                Searching…
+              </>
+            ) : hasScanned ? (
+              "Search again"
+            ) : (
+              "Find my TV"
+            )}
+          </button>
+        </div>
       </div>
 
-      {/* Error */}
-      {error && (
-        <ErrorBanner
-          error={error.error}
-          hint={error.hint}
-          onDismiss={() => setError(null)}
-        />
-      )}
+      {/* Results */}
+      <section
+        aria-labelledby="discover-results-heading"
+        className="flex min-w-0 flex-col gap-4 lg:col-start-2 lg:row-span-2 lg:row-start-1"
+      >
+        <h2
+          id="discover-results-heading"
+          className="m-0 font-sans text-sm font-semibold text-ink"
+        >
+          {tvs.length > 0
+            ? `${tvs.length === 1 ? "1 TV" : `${tvs.length} TVs`} on your network`
+            : "TVs on your network"}
+        </h2>
+        <p role="status" className="sr-only">
+          {announcement}
+        </p>
 
-      {/* TV list */}
-      {tvs.length > 0 && (
-        <div className="space-y-3">
-          <p className="text-sm font-medium text-slate-600">
-            {tvs.length === 1 ? "1 TV found" : `${tvs.length} TVs found`}
-          </p>
-          {tvs.map((tv) => (
-            <TvCard key={tv.id} tv={tv} onSelect={onSelectTv} />
-          ))}
-        </div>
-      )}
+        {error && (
+          <ErrorBanner error={error.error} hint={error.hint} onDismiss={() => setError(null)} />
+        )}
 
-      {/* Manual IP entry */}
-      {(hasScanned || tvs.length > 0) && (
-        <div className="text-center">
-          {!showManual ? (
-            <button
-              onClick={() => setShowManual(true)}
-              className="text-sm text-slate-400 hover:text-slate-600 transition-colors underline underline-offset-2"
-            >
-              Enter IP address manually
-            </button>
-          ) : (
-            <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
-              <p className="text-sm font-medium text-slate-700">
-                Enter your TV's IP address
-              </p>
-              <p className="text-xs text-slate-400">
-                Find it in your TV settings under Network → Network Status
-              </p>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={manualIp}
-                  onChange={(e) => setManualIp(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && addManual()}
-                  placeholder="192.168.1.100"
-                  className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-                <button
-                  onClick={addManual}
-                  disabled={manualLoading || !manualIp.trim()}
-                  className="bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
-                >
-                  {manualLoading ? "…" : "Add"}
-                </button>
-                <button
-                  onClick={() => {
-                    setShowManual(false);
-                    setManualIp("");
-                    setManualError(null);
-                  }}
-                  className="text-slate-400 hover:text-slate-600 px-2 transition-colors"
-                >
-                  Cancel
-                </button>
-              </div>
-              {manualError && (
-                <p className="text-xs text-red-600">{manualError}</p>
-              )}
-            </div>
-          )}
-        </div>
-      )}
+        {tvs.length > 0 && (
+          <ul className="m-0 flex list-none flex-col gap-3 p-0">
+            {tvs.map((tv) => (
+              <li key={tv.id}>
+                <TvCard tv={tv} onSelect={onSelectTv} />
+              </li>
+            ))}
+          </ul>
+        )}
+
+        {tvs.length === 0 && scanning && (
+          <div className="flex min-h-[180px] items-center justify-center gap-3 rounded-[14px] bg-wall px-6 py-10 text-ink">
+            <Spinner className="h-5 w-5" />
+            <span className="font-medium">Looking for Samsung TVs on your network…</span>
+          </div>
+        )}
+
+        {tvs.length === 0 && !scanning && !hasScanned && !error && (
+          <div className="flex min-h-[180px] flex-col items-center justify-center gap-1 rounded-[14px] bg-wall px-6 py-10 text-center">
+            <p className="m-0 font-semibold text-ink">Your TV will show up here</p>
+            <p className="m-0 text-muted">
+              Press Find my TV, or add it by IP address.
+            </p>
+          </div>
+        )}
+
+        {noResults && !scanning && (
+          <div className="flex flex-col gap-3 rounded-xl border border-line-strong bg-surface px-5 py-[18px]">
+            <p className="m-0 text-base font-semibold text-ink">No TVs found</p>
+            <p className="m-0 text-muted">Some things to check before you search again:</p>
+            <ul className="m-0 flex list-disc flex-col gap-1 pl-[18px] text-ink">
+              <li>The TV is switched on. Some TVs stop answering in deep standby.</li>
+              <li>
+                This device is on the same Wi-Fi as the TV, not a guest network, and no VPN is
+                running.
+              </li>
+              <li>
+                Some routers hide devices from each other (often called client or AP isolation).
+                If so, add the TV by its IP address instead.
+              </li>
+            </ul>
+          </div>
+        )}
+      </section>
+
+      {/* Manual entry: always available */}
+      <div className="lg:col-start-1 lg:row-start-2 lg:self-start">
+        <ManualIpForm onTvsFound={onTvsFound} />
+      </div>
     </div>
-  );
-}
-
-function Spinner() {
-  return (
-    <svg
-      className="animate-spin h-4 w-4"
-      fill="none"
-      viewBox="0 0 24 24"
-    >
-      <circle
-        className="opacity-25"
-        cx="12"
-        cy="12"
-        r="10"
-        stroke="currentColor"
-        strokeWidth="4"
-      />
-      <path
-        className="opacity-75"
-        fill="currentColor"
-        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-      />
-    </svg>
   );
 }

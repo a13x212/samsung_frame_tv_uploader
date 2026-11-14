@@ -1,9 +1,11 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { DiscoveredTV, TvConnection } from "@/lib/types";
+import type { ApiResult, DiscoveredTV, TvConnection } from "@/lib/types";
 import { startPairing, getPairingStatus } from "@/lib/api-client";
-import ErrorBanner from "@/components/ErrorBanner";
+import AllowPromptIllustration from "@/components/setup/AllowPromptIllustration";
+import Spinner from "@/components/setup/Spinner";
+import { PRIMARY_BUTTON, SECONDARY_BUTTON } from "@/components/setup/styles";
 
 interface PairStepProps {
   tv: DiscoveredTV;
@@ -15,6 +17,8 @@ interface PairStepProps {
 
 const PAIR_TIMEOUT_SECS = 60;
 
+type View = "connecting" | "waiting" | "paired" | "rejected" | "error" | "timeout";
+
 export default function PairStep({
   tv,
   connection,
@@ -23,11 +27,27 @@ export default function PairStep({
   onCancel,
 }: PairStepProps) {
   const [secondsLeft, setSecondsLeft] = useState(PAIR_TIMEOUT_SECS);
+  /** True while the POST that asks the TV to show its prompt is in flight. */
+  const [requesting, setRequesting] = useState(false);
+
   // Use a ref (not state) so React 18 Strict Mode's double-invoke doesn't
   // fire two simultaneous pair requests to the TV.
   const hasStartedRef = useRef(false);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pairedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Set while the effect is live; lets async work started before an unmount
+  // notice it and bail out instead of creating intervals nobody clears.
+  const mountedRef = useRef(false);
+  // Each pairing attempt gets an id so late responses from an earlier attempt
+  // (e.g. after "Ask again") are ignored.
+  const attemptRef = useRef(0);
+
+  // Always call the latest callbacks from timers.
+  const onPairedRef = useRef(onPaired);
+  const onConnectionUpdateRef = useRef(onConnectionUpdate);
+  onPairedRef.current = onPaired;
+  onConnectionUpdateRef.current = onConnectionUpdate;
 
   const stopPolling = () => {
     if (pollingRef.current) {
@@ -42,14 +62,35 @@ export default function PairStep({
 
   const startPairingFlow = async () => {
     hasStartedRef.current = true;
+    stopPolling();
+    const attempt = ++attemptRef.current;
     setSecondsLeft(PAIR_TIMEOUT_SECS);
+    setRequesting(true);
+    onConnectionUpdateRef.current({
+      tvId: tv.id,
+      status: "connecting",
+      errorMessage: null,
+      connectedAt: null,
+    });
 
-    const res = await startPairing(tv.id);
+    let res: ApiResult<{ tvId: string }>;
+    try {
+      res = await startPairing(tv.id);
+    } catch {
+      res = {
+        ok: false,
+        error: "Network error",
+        hint: "This device couldn't reach the uploader. Check its connection and try again.",
+      };
+    }
+    if (!mountedRef.current || attempt !== attemptRef.current) return;
+    setRequesting(false);
+
     if (!res.ok) {
-      onConnectionUpdate({
+      onConnectionUpdateRef.current({
         tvId: tv.id,
         status: "error",
-        errorMessage: res.hint,
+        errorMessage: res.hint || res.error,
         connectedAt: null,
       });
       return;
@@ -57,187 +98,267 @@ export default function PairStep({
 
     // Poll status every second
     pollingRef.current = setInterval(async () => {
-      const statusRes = await getPairingStatus(tv.id);
+      let statusRes: ApiResult<TvConnection>;
+      try {
+        statusRes = await getPairingStatus(tv.id);
+      } catch {
+        return; // transient; the next tick retries
+      }
+      if (!mountedRef.current || attempt !== attemptRef.current) return;
       if (!statusRes.ok) return;
 
       const conn = statusRes.data;
-      onConnectionUpdate(conn);
-
       if (conn.status === "paired") {
         stopPolling();
-        setTimeout(onPaired, 800);
-      } else if (conn.status === "rejected" || conn.status === "error") {
-        stopPolling();
+        onConnectionUpdateRef.current(conn);
+        // Let the success state show briefly; schedule once even if two
+        // in-flight polls both report "paired".
+        if (!pairedTimerRef.current) {
+          pairedTimerRef.current = setTimeout(() => {
+            if (mountedRef.current) onPairedRef.current();
+          }, 800);
+        }
+      } else if (pollingRef.current) {
+        // Ignore stragglers that land after polling stopped (e.g. timed out).
+        onConnectionUpdateRef.current(conn);
+        if (conn.status === "rejected" || conn.status === "error") stopPolling();
       }
     }, 1000);
 
-    // Countdown
+    // Countdown, computed from a deadline so throttled background tabs stay accurate.
+    const deadline = Date.now() + PAIR_TIMEOUT_SECS * 1000;
     countdownRef.current = setInterval(() => {
-      setSecondsLeft((s) => {
-        if (s <= 1) {
-          stopPolling();
-          return 0;
-        }
-        return s - 1;
-      });
+      const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      setSecondsLeft(left);
+      if (left === 0) stopPolling();
     }, 1000);
   };
 
   // Auto-start pairing on mount
   useEffect(() => {
+    mountedRef.current = true;
     if (!hasStartedRef.current) {
       startPairingFlow();
     }
-    return stopPolling;
+    return () => {
+      mountedRef.current = false;
+      stopPolling();
+      if (pairedTimerRef.current) {
+        clearTimeout(pairedTimerRef.current);
+        pairedTimerRef.current = null;
+      }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const status = connection?.status ?? "connecting";
+  const view: View =
+    status === "paired"
+      ? "paired"
+      : status === "rejected"
+        ? "rejected"
+        : status === "error"
+          ? "error"
+          : secondsLeft === 0
+            ? "timeout"
+            : status === "awaiting_approval"
+              ? "waiting"
+              : "connecting";
+
+  const chooseDifferentTv = () => {
+    attemptRef.current++; // drop any in-flight responses
+    stopPolling();
+    onCancel();
+  };
+
+  const copy = headingCopy(view, tv);
 
   return (
-    <div className="mx-auto max-w-2xl space-y-6">
-      <div className="rounded-2xl border border-slate-200 bg-white p-8 shadow-sm">
-        <div className="text-center">
-          {/* TV animation */}
-          <div className="relative w-20 h-20 mx-auto mb-6">
-            <div
-              className={`w-20 h-20 rounded-2xl flex items-center justify-center ${
-                status === "paired"
-                  ? "bg-green-100"
-                  : status === "rejected" || status === "error"
-                  ? "bg-red-100"
-                  : "bg-blue-100"
-              }`}
-            >
-              <svg
-                className={`w-11 h-11 ${
-                  status === "paired"
-                    ? "text-green-600"
-                    : status === "rejected" || status === "error"
-                    ? "text-red-500"
-                    : "text-blue-600"
-                }`}
-                fill="none"
-                viewBox="0 0 24 24"
-                strokeWidth={1.5}
-                stroke="currentColor"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  d="M6 20.25h12m-7.5-3v3m3-3v3m-10.125-3h17.25c.621 0 1.125-.504 1.125-1.125V4.875c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125z"
-                />
-              </svg>
-            </div>
-            {status === "awaiting_approval" && (
-              <span className="absolute -top-1 -right-1 flex h-5 w-5">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
-                <span className="relative inline-flex rounded-full h-5 w-5 bg-blue-500" />
-              </span>
-            )}
-          </div>
-
-          <h2 className="text-xl font-semibold text-slate-900 mb-2">
-            {tv.name}
-          </h2>
-
-          {/* Status messages */}
-          {status === "connecting" && (
-            <>
-              <p className="text-slate-500 mb-1">Connecting…</p>
-              <div className="flex justify-center mt-3">
-                <Spinner />
-              </div>
-            </>
-          )}
-
-          {status === "awaiting_approval" && (
-            <>
-              <p className="text-slate-700 font-medium mb-1">
-                Look at your TV and press <span className="text-blue-600">Allow</span>
-              </p>
-              <p className="text-slate-500 text-sm mb-4">
-                A permission dialog is showing on your TV screen. Use your remote to approve it.
-              </p>
-              <div className="inline-flex items-center gap-2 text-sm text-slate-400">
-                <svg
-                  className="w-4 h-4"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  strokeWidth={1.5}
-                  stroke="currentColor"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z"
-                  />
-                </svg>
-                {secondsLeft}s remaining
-              </div>
-            </>
-          )}
-
-          {status === "paired" && (
-            <>
-              <p className="text-green-700 font-medium mb-1">Connected!</p>
-              <p className="text-slate-500 text-sm">Taking you to the upload screen…</p>
-            </>
-          )}
-        </div>
-
-        {/* Error states */}
-        {(status === "rejected" || status === "error") && (
-          <div className="mt-4 space-y-4">
-            <ErrorBanner
-              error={
-                status === "rejected"
-                  ? "TV denied the connection"
-                  : "Connection failed"
-              }
-              hint={
-                connection?.errorMessage ??
-                (status === "rejected"
-                  ? "Press Allow when the dialog appears on your TV screen."
-                  : "Make sure your TV is on and on the same Wi-Fi network.")
-              }
-            />
-            <button
-              onClick={() => {
-                hasStartedRef.current = false;
-                startPairingFlow();
-              }}
-              className="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 rounded-xl transition-colors"
-            >
-              Try Again
-            </button>
-          </div>
-        )}
+    <div className="mx-auto grid w-full max-w-[1180px] items-center gap-8 py-1 sm:py-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,460px)] lg:gap-14 lg:py-12">
+      <div className="mx-auto w-full max-w-xl lg:max-w-none">
+        <AllowPromptIllustration state={view === "paired" ? "done" : "prompt"} />
       </div>
 
-      {/* Cancel */}
-      {status !== "paired" && (
-        <div className="text-center">
-          <button
-            onClick={() => {
-              stopPolling();
-              onCancel();
-            }}
-            className="text-sm text-slate-400 hover:text-slate-600 transition-colors"
-          >
-            Cancel and go back
-          </button>
+      <div className="flex min-w-0 flex-col gap-5">
+        <div>
+          <h1 className="m-0 text-[28px] leading-[1.15] tracking-[-0.01em] text-ink sm:text-[34px]">
+            {copy.heading}
+          </h1>
+          <p className="mb-0 mt-3 text-base text-muted">{copy.body}</p>
         </div>
-      )}
+
+        <StatusCard view={view} secondsLeft={secondsLeft} tv={tv} connection={connection} />
+
+        {view !== "paired" && (
+          <>
+            <section
+              aria-labelledby="pair-help-heading"
+              className="flex flex-col gap-2 rounded-xl border border-line-strong px-5 py-[18px]"
+            >
+              <h2 id="pair-help-heading" className="m-0 font-sans text-sm font-semibold text-ink">
+                Not seeing the prompt?
+              </h2>
+              <ul className="m-0 flex list-disc flex-col gap-1 pl-[18px] text-muted">
+                <li>Wake the TV. It can&apos;t ask while fully off.</li>
+                <li>
+                  Make sure this device and the TV ({tv.ip}) are on the same network.
+                </li>
+                <li>
+                  If you once pressed Deny, re-allow the app in the TV&apos;s Device Connection
+                  Manager.
+                </li>
+              </ul>
+            </section>
+
+            <div className="flex flex-col gap-2.5 sm:flex-row sm:flex-wrap">
+              <button
+                type="button"
+                onClick={() => startPairingFlow()}
+                disabled={requesting}
+                className={PRIMARY_BUTTON}
+              >
+                {requesting ? (
+                  <>
+                    <Spinner />
+                    Asking the TV…
+                  </>
+                ) : (
+                  "Ask again"
+                )}
+              </button>
+              <button type="button" onClick={chooseDifferentTv} className={SECONDARY_BUTTON}>
+                Choose a different TV
+              </button>
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }
 
-function Spinner() {
+function headingCopy(view: View, tv: DiscoveredTV): { heading: string; body: string } {
+  switch (view) {
+    case "paired":
+      return {
+        heading: `${tv.name} is connected`,
+        body: "Permission granted. The app remembers this TV, so you won't need to do this again.",
+      };
+    case "rejected":
+      return {
+        heading: "The TV didn't allow the connection",
+        body: `${tv.name} answered Deny, or the prompt was closed. Press Ask again and choose Allow this time.`,
+      };
+    case "error":
+      return {
+        heading: `Couldn't connect to ${tv.name}`,
+        body: "Something went wrong while asking the TV for permission.",
+      };
+    case "timeout":
+      return {
+        heading: "No answer from the TV",
+        body: `${tv.name} didn't respond within ${PAIR_TIMEOUT_SECS} seconds. Press Ask again to show the prompt again.`,
+      };
+    default:
+      return {
+        heading: "Press Allow on your TV remote",
+        body: `${tv.name} is asking for permission. You only do this once. The app remembers this TV afterwards.`,
+      };
+  }
+}
+
+interface StatusCardProps {
+  view: View;
+  secondsLeft: number;
+  tv: DiscoveredTV;
+  connection: TvConnection | null;
+}
+
+/**
+ * One persistent live region whose content changes with the state, so screen
+ * readers announce each transition. The per-second countdown is hidden from
+ * assistive tech; a coarser "about N seconds" line is announced instead.
+ */
+function StatusCard({ view, secondsLeft, tv, connection }: StatusCardProps) {
+  const counting = view === "connecting" || view === "waiting";
+  const tone =
+    view === "paired"
+      ? "border-success bg-[#EEF7F1]"
+      : view === "rejected" || view === "error" || view === "timeout"
+        ? "border-danger-line bg-[#FCF3F2]"
+        : "border-line bg-surface";
+
+  let title: string;
+  let detail: string | null = null;
+  switch (view) {
+    case "connecting":
+      title = `Contacting ${tv.name}…`;
+      break;
+    case "waiting":
+      title = "Waiting for the TV";
+      break;
+    case "paired":
+      title = "Connected. One moment…";
+      break;
+    case "rejected":
+      title = "Not allowed";
+      detail = connection?.errorMessage ?? "The TV declined the request.";
+      break;
+    case "error":
+      title = "Connection failed";
+      detail =
+        connection?.errorMessage ?? "Make sure the TV is on and on the same network as this device.";
+      break;
+    case "timeout":
+      title = "Timed out";
+      detail = "The TV didn't answer in time. Nothing was changed on the TV.";
+      break;
+  }
+
+  // Announce remaining time only at 15 second steps.
+  const coarse = Math.ceil(secondsLeft / 15) * 15;
+
   return (
-    <svg className="animate-spin h-5 w-5 text-blue-500" fill="none" viewBox="0 0 24 24">
-      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-    </svg>
+    <div
+      role="status"
+      className={`flex flex-col gap-2.5 rounded-xl border px-5 py-[18px] ${tone}`}
+    >
+      <div className="flex items-baseline justify-between gap-3">
+        <span
+          className={`flex items-center gap-2 font-semibold ${
+            view === "paired"
+              ? "text-success"
+              : view === "rejected" || view === "error" || view === "timeout"
+                ? "text-danger"
+                : "text-ink"
+          }`}
+        >
+          {view === "connecting" && <Spinner />}
+          {view === "paired" && (
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+              <path d="M5 12.5l4.5 4.5L19 7" />
+            </svg>
+          )}
+          {title}
+        </span>
+        {counting && (
+          <>
+            <span aria-hidden="true" className="text-muted [font-variant-numeric:tabular-nums]">
+              {secondsLeft} s left
+            </span>
+            <span className="sr-only">About {coarse} seconds left.</span>
+          </>
+        )}
+      </div>
+      {counting && (
+        <div aria-hidden="true" className="h-1.5 overflow-hidden rounded-[3px] bg-wall">
+          <div
+            className="h-full rounded-[3px] bg-accent transition-[width] duration-1000 ease-linear motion-reduce:transition-none"
+            style={{ width: `${(secondsLeft / PAIR_TIMEOUT_SECS) * 100}%` }}
+          />
+        </div>
+      )}
+      {detail && <p className="m-0 text-ink">{detail}</p>}
+    </div>
   );
 }
