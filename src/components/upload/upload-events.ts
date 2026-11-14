@@ -29,6 +29,32 @@ export function isAcceptedFile(file: File): boolean {
   return (file.type === "" || file.type === "application/octet-stream") && ACCEPTED_EXT.test(file.name);
 }
 
+const EXT_TYPE: Record<string, string> = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  webp: "image/webp",
+  heic: "image/heic",
+  heif: "image/heif",
+  tif: "image/tiff",
+  tiff: "image/tiff",
+  gif: "image/gif",
+};
+
+/**
+ * The server's multer filter silently drops any part whose Content-Type is not
+ * an allowed image type. A dropped file would shift every later file's
+ * position, breaking both the positional matteIds and the order-based event
+ * matching below. Browsers often leave HEIC untyped, so give such files an
+ * explicit type from their extension before they are sent.
+ */
+export function withServerType(file: File): File {
+  if (ACCEPTED_TYPES.includes(file.type)) return file;
+  const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+  const type = EXT_TYPE[ext];
+  return type ? new File([file], file.name, { type, lastModified: file.lastModified }) : file;
+}
+
 export interface SkippedFiles {
   /** Files that are not a supported image type. */
   unsupported: string[];
@@ -48,7 +74,7 @@ export function partitionFiles(
   const supported: File[] = [];
   const unsupported: string[] = [];
   for (const f of files) {
-    if (isAcceptedFile(f)) supported.push(f);
+    if (isAcceptedFile(f)) supported.push(withServerType(f));
     else unsupported.push(f.name);
   }
   const room = Math.max(0, max - alreadyPending);
